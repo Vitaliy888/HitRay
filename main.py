@@ -193,11 +193,13 @@ async def cb_get_sub(cb: types.CallbackQuery):
         return
 
     await cb.message.edit_text(
-        f"✅ <b>Подписка готова</b>\n\nСкопируй строку ниже в приложение:",
+        f"✅ <b>Подписка готова</b> — {total} конфигов\n\n"
+        "Импортируй файл в приложение (V2rayNG, Hiddify, Streisand и др.)",
         parse_mode="HTML",
         reply_markup=kb_back_main()
     )
-    await cb.message.answer(f"<code>{b64}</code>", parse_mode="HTML")
+    sub_file = types.BufferedInputFile(b64.encode(), filename="subscription.txt")
+    await cb.message.answer_document(sub_file)
 
 
 # ── Меню источников ──────────────────────────────────────────────────────────

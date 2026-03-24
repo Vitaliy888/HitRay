@@ -4,7 +4,7 @@ import base64
 import re
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 TOKEN = os.getenv('BOT_TOKEN')
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 6
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()

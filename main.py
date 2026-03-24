@@ -139,9 +139,12 @@ def extract_host_port(uri: str):
 
 def resolve_host(host: str):
     try:
+        socket.setdefaulttimeout(3)
         return socket.gethostbyname(host)
     except Exception:
         return None
+    finally:
+        socket.setdefaulttimeout(None)
 
 
 def get_geo(ip: str) -> tuple:

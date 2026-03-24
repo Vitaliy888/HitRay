@@ -54,7 +54,7 @@ def fetch_data():
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 # Ищем vless, vmess, ss, trojan
-                found = re.findall(r'(vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
+                found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
                 all_configs.update(found)
         except:
             continue

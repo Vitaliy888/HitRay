@@ -160,6 +160,7 @@ async def cmd_start(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await cb.answer()
     await cb.message.edit_text(
         "👋 <b>VlessFlow</b>\n\n"
         "Собираю рабочие VPN-серверы из открытых источников, "
@@ -178,9 +179,10 @@ async def cb_get_sub(cb: types.CallbackQuery):
         await cb.answer("Нет источников! Добавьте хотя бы один.", show_alert=True)
         return
 
+    await cb.answer()
     await cb.message.edit_text("🔄 Собираю конфиги из источников...")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     b64, total = await loop.run_in_executor(None, build_subscription, sources)
 
     if not b64:
@@ -203,6 +205,7 @@ async def cb_get_sub(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "sources_menu")
 async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await cb.answer()
     sources = load_sources()
     await cb.message.edit_text(
         f"⚙️ <b>Управление источниками</b>\n\nСейчас активно: <b>{len(sources)}</b>",
@@ -214,6 +217,7 @@ async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
 # Список источников
 @dp.callback_query(F.data.in_({"list_sources"}) | F.data.startswith("src_page_"))
 async def cb_list_sources(cb: types.CallbackQuery):
+    await cb.answer()
     page = 0
     if cb.data.startswith("src_page_"):
         page = int(cb.data.split("_")[-1])
@@ -281,6 +285,7 @@ async def cb_delete_source(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "add_source")
 async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddSource.waiting_url)
+    await cb.answer()
     await cb.message.edit_text(
         "➕ <b>Добавить источник</b>\n\n"
         "Отправь ссылку на файл с VPN-конфигами.\n\n"
@@ -307,7 +312,7 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
 
     msg = await m.answer("🔍 Проверяю источник...")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     count = await loop.run_in_executor(None, validate_source, url)
 
     if count == 0:

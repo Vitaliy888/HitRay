@@ -7,10 +7,9 @@ import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-# Получаем токен из настроек хостинга (Environment Variables)
 TOKEN = os.getenv('BOT_TOKEN')
 
-# Твои источники ссылок (очищены от ссылок на папки, оставлены только RAW и API)
+# Список твоих источников
 SOURCES = [
     "https://raw.githubusercontent.com/Kirillo4ka/eavevpn-configs/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
     "https://raw.githubusercontent.com/Kirillo4ka/eavevpn-configs/refs/heads/main/BLACK_VLESS_RUS.txt",
@@ -33,78 +32,72 @@ SOURCES = [
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-def get_country_flag(address):
-    """Определяет страну по IP/Домену и возвращает флаг или код."""
+def get_flag(addr):
+    """Определяет страну по IP/Хосту."""
     try:
-        ip = socket.gethostbyname(address)
-        # Используем бесплатный API для определения страны
-        res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,countryCode", timeout=2).json()
-        if res.get('status') == 'success':
-            code = res.get('countryCode', 'UN')
-            return f"[{code}]"
+        ip = socket.gethostbyname(addr)
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=1).json()
+        return f"[{r.get('countryCode', '??')}]"
     except:
-        pass
-    return "[??]"
+        return "[UN]"
 
-def process_configs():
-    """Сбор, фильтрация и сортировка конфигов."""
-    unique_configs = set()
+def fetch_data():
+    all_configs = set()
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     for url in SOURCES:
+        # Авто-замена обычных ссылок GitHub на RAW, если ты случайно вставил не ту
+        url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/").replace("/tree/", "/")
+        
         try:
-            response = requests.get(url, timeout=15).text
-            # Ищем протоколы vless, vmess и ss
-            found = re.findall(r'(vless|vmess|ss)://[^\s|#]+', response)
-            unique_configs.update(found)
-        except Exception as e:
-            print(f"Ошибка при чтении {url}: {e}")
+            print(f"Проверяю: {url}")
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                # Ищем vless, vmess, ss, trojan
+                found = re.findall(r'(vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
+                all_configs.update(found)
+        except:
             continue
 
-    final_list = []
-    # Берем первые 150 для стабильности на бесплатном хостинге
-    for config in list(unique_configs)[:150]:
-        # Извлекаем адрес сервера для GeoIP
-        match = re.search(r'@([^:]+):', config)
+    final = []
+    # Обрабатываем найденное
+    for conf in list(all_configs)[:200]:
+        # Чистим от мусора
+        conf = conf.strip()
+        # Пробуем вытащить адрес для флага
+        match = re.search(r'@([^:/]+)[:/]', conf)
         if match:
-            addr = match.group(1)
-            flag = get_country_flag(addr)
-            # Добавляем метку страны в конец ссылки через #
-            config += f"#{flag}_VlessFlow_Node"
-        final_list.append(config)
-    
-    return "\n".join(final_list)
+            host = match.group(1)
+            flag = get_flag(host)
+            # Убираем старый тег после # и ставим свой
+            base = conf.split('#')[0]
+            conf = f"{base}#{flag}_VlessFlow"
+        final.append(conf)
+        
+    return "\n".join(final)
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 **Добро пожаловать в VlessFlow!**\n\n"
-        "Я автоматически собираю и фильтрую VLESS/SS ссылки из надежных источников.\n\n"
-        "🔹 Используй /get_sub чтобы получить подписку.\n"
-        "🔹 Все ссылки проверены на формат и размечены по странам."
-    )
+async def start(m: types.Message):
+    await m.answer("✅ Бот готов. Нажми /get_sub для получения свежей подписки.")
 
 @dp.message(Command("get_sub"))
-async def cmd_get_sub(message: types.Message):
-    wait_msg = await message.answer("⏳ Собираю актуальные узлы... Пожалуйста, подождите.")
+async def sub(m: types.Message):
+    msg = await m.answer("🔄 Сканирую источники... Это может занять до 20 секунд.")
     
-    # Запускаем тяжелую задачу в отдельном потоке, чтобы бот не «зависал»
+    # Выполняем сбор в отдельном потоке
     loop = asyncio.get_event_loop()
-    configs_data = await loop.run_in_executor(None, process_configs)
+    data = await loop.run_in_executor(None, fetch_data)
     
-    if configs_data:
-        # Кодируем в Base64 для прямой вставки в HAP/Hiddify
-        encoded = base64.b64encode(configs_data.encode()).decode()
-        await wait_msg.delete()
-        await message.answer("✅ **Ваша подписка готова!**\n\nСкопируйте код ниже и добавьте его в HAP:")
-        await message.answer(f"`{encoded}`", parse_mode="Markdown")
+    if data:
+        b64 = base64.b64encode(data.encode()).decode()
+        await msg.delete()
+        await m.answer("🚀 Твоя подписка (Base64) для HAP/Hiddify:")
+        # Отправляем в моноширинном шрифте, чтобы удобно было копировать
+        await m.answer(f"`{b64}`", parse_mode="Markdown")
     else:
-        await message.answer("❌ Ошибка: не удалось получить данные из источников.")
+        await m.answer("⚠️ Ссылки не найдены. Проверь источники или попробуй позже.")
 
 async def main():
-    if not TOKEN:
-        print("КРИТИЧЕСКАЯ ОШИБКА: Токен не найден в переменных окружения!")
-        return
-    print("Бот запущен и готов к работе...")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':

@@ -2,10 +2,9 @@ import asyncio
 import requests
 import base64
 import re
-import socket
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -17,10 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 TOKEN = os.getenv('BOT_TOKEN')
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
-MAX_WORKERS = 30
-MAX_PER_COUNTRY = 10
-GEO_TIMEOUT = 3
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 6
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -123,91 +119,27 @@ def kb_back_main():
 
 # ─── VPN логика ─────────────────────────────────────────────────────────────
 
-def extract_host_port(uri: str):
-    proto = uri.split('://')[0].lower()
-    if proto == 'vmess':
-        try:
-            data = json.loads(base64.b64decode(uri[8:] + '==').decode(errors='ignore'))
-            return str(data.get('add', '')), int(data.get('port', 0))
-        except Exception:
-            return None, None
-    m = re.search(r'@([^:/\[\]]+|\[[^\]]+\]):(\d+)', uri)
-    if m:
-        return m.group(1), int(m.group(2))
-    return None, None
-
-
-def resolve_host(host: str):
+def fetch_one(url: str) -> list:
     try:
-        return socket.gethostbyname(host)
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 200:
+            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
     except Exception:
-        return None
-
-
-def get_geo(ip: str) -> tuple:
-    try:
-        r = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=countryCode,country",
-            timeout=GEO_TIMEOUT
-        ).json()
-        return r.get('countryCode') or 'UN', r.get('country') or 'Unknown'
-    except Exception:
-        return 'UN', 'Unknown'
-
-
-def process_config(uri: str):
-    host, port = extract_host_port(uri)
-    if not host or not port:
-        return None
-    ip = resolve_host(host)
-    if not ip:
-        return None
-    code, name = get_geo(ip)
-    base = uri.split('#')[0]
-    return f"{base}#{code}-VlessFlow", code, name
-
-
-def fetch_raw_configs(sources: list) -> list:
-    seen = set()
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    for url in sources:
-        try:
-            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 200:
-                found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
-                for f in found:
-                    seen.add(f.strip())
-        except Exception:
-            continue
-    return list(seen)
+        pass
+    return []
 
 
 def build_subscription(sources: list):
-    print(f"Сбор конфигов из {len(sources)} источников...")
-    raw = fetch_raw_configs(sources)
-    print(f"Уникальных конфигов: {len(raw)}, обрабатываю...")
-
-    by_country = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_config, uri): uri for uri in raw}
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result:
-                tagged, code, name = result
-                if code not in by_country:
-                    by_country[code] = {'name': name, 'configs': []}
-                by_country[code]['configs'].append(tagged)
-
-    final = []
-    for code in sorted(by_country):
-        final.extend(by_country[code]['configs'][:MAX_PER_COUNTRY])
-
-    print(f"Готово: {len(final)} серверов в {len(by_country)} странах")
-    if not final:
-        return '', {}
-
-    b64 = base64.b64encode('\n'.join(final).encode()).decode()
-    return b64, by_country
+    seen = set()
+    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        for configs in ex.map(fetch_one, sources):
+            for c in configs:
+                seen.add(c.strip())
+    configs = list(seen)
+    if not configs:
+        return '', 0
+    b64 = base64.b64encode('\n'.join(configs).encode()).decode()
+    return b64, len(configs)
 
 
 # ─── Хэндлеры ───────────────────────────────────────────────────────────────
@@ -246,33 +178,20 @@ async def cb_get_sub(cb: types.CallbackQuery):
         await cb.answer("Нет источников! Добавьте хотя бы один.", show_alert=True)
         return
 
-    await cb.message.edit_text(
-        "🔄 Собираю конфиги и проверяю серверы...\n"
-        "Это займёт 1-2 минуты."
-    )
+    await cb.message.edit_text("🔄 Собираю конфиги из источников...")
 
     loop = asyncio.get_event_loop()
-    b64, by_country = await loop.run_in_executor(None, build_subscription, sources)
+    b64, total = await loop.run_in_executor(None, build_subscription, sources)
 
     if not b64:
         await cb.message.edit_text(
-            "⚠️ Рабочих серверов не найдено. Попробуй позже.",
+            "⚠️ Конфигов не найдено. Проверь источники и попробуй снова.",
             reply_markup=kb_back_main()
         )
         return
 
-    total = sum(min(len(v['configs']), MAX_PER_COUNTRY) for v in by_country.values())
-    lines = []
-    for code in sorted(by_country):
-        name = by_country[code]['name']
-        count = min(len(by_country[code]['configs']), MAX_PER_COUNTRY)
-        lines.append(f"  <code>{code}</code> {name}: {count}")
-    stats = "\n".join(lines)
-
     await cb.message.edit_text(
-        f"✅ <b>Подписка готова</b>\n\n"
-        f"Серверов: <b>{total}</b> в <b>{len(by_country)}</b> странах\n\n"
-        f"<b>По странам:</b>\n{stats}",
+        f"✅ <b>Подписка готова</b>\n\nСкопируй строку ниже в приложение:",
         parse_mode="HTML",
         reply_markup=kb_back_main()
     )

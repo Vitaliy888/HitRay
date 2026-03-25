@@ -1,10 +1,12 @@
 import asyncio
+import ipaddress
 import requests
 import base64
 import re
 import json
 import os
 import socket
+import ssl
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -245,6 +247,89 @@ def tcp_ping(host: str, port: int) -> float:
         return float('inf')
 
 
+# ─── CDN-детектор ────────────────────────────────────────────────────────────
+
+# Официальные IP-диапазоны Cloudflare (https://www.cloudflare.com/ips/)
+_CF_RANGES = [ipaddress.ip_network(r) for r in [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15',
+    '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+]]
+
+
+def is_cdn_ip(host: str) -> bool:
+    """True если host — IP из CDN-диапазона (Cloudflare и др.)."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return any(ip in net for net in _CF_RANGES)
+    except ValueError:
+        # Это доменное имя — резолвим
+        try:
+            resolved = socket.gethostbyname(host)
+            ip = ipaddress.ip_address(resolved)
+            return any(ip in net for net in _CF_RANGES)
+        except Exception:
+            return False
+
+
+# ─── Транспортный парсер ──────────────────────────────────────────────────────
+
+def parse_transport(config: str) -> tuple[str, str, str]:
+    """Возвращает (transport, path, sni) из параметров URI."""
+    transport, path, sni = 'tcp', '/', ''
+    try:
+        if '?' in config:
+            query = config.split('?', 1)[1].split('#')[0]
+            params = {}
+            for p in query.split('&'):
+                if '=' in p:
+                    k, v = p.split('=', 1)
+                    params[k.lower()] = urllib.parse.unquote(v)
+            transport = params.get('type', 'tcp').lower()
+            path = params.get('path', '/') or '/'
+            sni = params.get('sni', params.get('host', ''))
+    except Exception:
+        pass
+    return transport, path, sni
+
+
+# ─── WS-проба ─────────────────────────────────────────────────────────────────
+
+_TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
+
+
+def ws_probe(host: str, port: int, path: str = '/', sni: str = '') -> bool:
+    """
+    Отправляет WebSocket Upgrade на конкретный path с правильным SNI.
+    101 / 400 / 403 = сервер (или CDN) ответил → маршрутизация работает.
+    Нет ответа / обрыв = сервер мёртв или CDN не знает куда роутить → False.
+    """
+    effective_host = sni or host
+    request = (
+        f'GET {path} HTTP/1.1\r\n'
+        f'Host: {effective_host}\r\n'
+        f'Upgrade: websocket\r\n'
+        f'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        f'Sec-WebSocket-Version: 13\r\n\r\n'
+    ).encode()
+    try:
+        if port in _TLS_PORTS:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as raw:
+                with ctx.wrap_socket(raw, server_hostname=effective_host) as s:
+                    s.sendall(request)
+                    return s.recv(16).startswith(b'HTTP/')
+        else:
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as s:
+                s.sendall(request)
+                return s.recv(16).startswith(b'HTTP/')
+    except Exception:
+        return False
+
 
 def fetch_one(url: str) -> list:
     """Скачать конфиги из источника. Поддерживает сырой текст и base64-подписки."""
@@ -275,16 +360,23 @@ def fetch_one(url: str) -> list:
 
 def _ping_entry(entry):
     """
-    Проверка сервера: два TCP-замера, берём лучший.
+    Многоуровневая проверка сервера:
 
-    Почему только TCP:
-    - VLESS+Reality: сервер ожидает браузерный TLS-фингерпринт (uTLS).
-      Python ssl не подходит → TLS-хэндшейк падает, хотя сервер живой.
-    - VLESS+WS за CDN (Cloudflare): WS-апгрейд без авторизации отклоняется CDN.
-      Happ при этом подключается нормально через VLESS-поверх-WS.
-    Итог: TLS и WS-проба давали 60-80% ложных отказов, убраны.
+    1. TCP-пинг (×2, берём лучший) — обязателен для всех.
+
+    2. WS-проба — ТОЛЬКО для transport=ws/httpupgrade.
+       Эти конфиги идут через CDN (Cloudflare), который ВСЕГДА отвечает на
+       TCP. Значит TCP-пинг — ложный «живой». Нужно проверить, что CDN
+       реально маршрутизирует запрос к бэкенду.
+       Ответ 101/400/403 (любой HTTP) = маршрут работает → сервер жив.
+       Нет ответа / обрыв = CDN не знает бэкенд → отбрасываем.
+
+    3. Reality/TCP/gRPC — только TCP-пинг. Прямой IP, пинг надёжен.
+       WS-проба для них ломалась (они не говорят WebSocket).
     """
     cfg, host, port = entry
+
+    # 1. TCP-пинг
     results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
     good = [r for r in results if r < float('inf')]
     if not good:
@@ -292,6 +384,15 @@ def _ping_entry(entry):
     best = min(good)
     if best > MAX_PING_MS:
         return float('inf'), cfg
+
+    # 2. WS-проба для CDN-конфигов
+    proto = cfg.split('://', 1)[0].lower()
+    if proto in ('vless', 'vmess', 'trojan'):
+        transport, path, sni = parse_transport(cfg)
+        if transport in ('ws', 'httpupgrade'):
+            if not ws_probe(host, port, path, sni):
+                return float('inf'), cfg
+
     return best, cfg
 
 

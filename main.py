@@ -349,11 +349,8 @@ def build_best_subscription(sources: list):
     summary = []
     for country in top_countries:
         servers = sorted(country_servers[country])[:SERVERS_PER_COUNTRY]
-        for i, (lat, cfg) in enumerate(servers):
-            # Убираем старый remark и ставим HitRay-XX или HitRay-XX-2, HitRay-XX-3
-            base = cfg.rsplit('#', 1)[0] if '#' in cfg else cfg
-            suffix = f'-{i + 1}' if i > 0 else ''
-            selected.append(f'{base}#HitRay-{country}{suffix}')
+        for lat, cfg in servers:
+            selected.append(cfg)
         summary.append((country, servers[0][0]))
 
     b64 = base64.b64encode('\n'.join(selected).encode()).decode()

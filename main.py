@@ -331,10 +331,27 @@ def ws_probe(host: str, port: int, path: str = '/', sni: str = '') -> bool:
 
 
 def fetch_one(url: str) -> list:
+    """Скачать конфиги из источника. Поддерживает сырой текст и base64-подписки."""
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
-        if resp.status_code == 200:
-            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', resp.text)
+        if resp.status_code != 200:
+            return []
+        text = resp.text.strip()
+
+        # Сначала пробуем как сырой текст
+        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        if found:
+            return found
+
+        # Не нашли — пробуем расшифровать как base64-подписку
+        try:
+            padded = text + '=' * (-len(text) % 4)
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            if found:
+                return found
+        except Exception:
+            pass
     except Exception:
         pass
     return []
@@ -343,32 +360,36 @@ def fetch_one(url: str) -> list:
 def _ping_entry(entry):
     """
     Проверка сервера по уровням:
-      1. TCP-пинг × 2      — стабильность соединения
-      2. TLS-хэндшейк      — для TLS-портов
-      3. WS-хэндшейк       — только для vless/vmess/trojan с transport=ws:
-                             отправляем Upgrade: websocket на правильный path,
-                             ждём любого HTTP ответа (101/400/403 = жив)
-      ss/trojan(tcp):  только п.1 + п.2
+      1. TCP-пинг × PING_ROUNDS — достаточно хотя бы одного успешного
+      2. TLS-хэндшейк           — только для TLS-портов
+      3. WS-проба               — для transport=ws: сервер ДОЛЖЕН ответить
+                                  хоть каким-то HTTP, иначе он мёртв.
+                                  CDN-серверы (Cloudflare) возвращают 400/403 — это OK.
+         httpupgrade/grpc/tcp   — только TCP + TLS, без дополнительной пробы
     """
     cfg, host, port = entry
     proto = cfg.split('://', 1)[0].lower()
 
-    # 1. TCP-пинг дважды
+    # 1. TCP-пинг: принимаем если хотя бы один из PING_ROUNDS прошёл
     results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
-    if any(r == float('inf') for r in results):
+    good = [r for r in results if r != float('inf') and r <= MAX_PING_MS]
+    if not good:
         return float('inf'), cfg
-    avg = round(sum(results) / len(results), 1)
+    avg = round(sum(good) / len(good), 1)
 
-    # 2. TLS-хэндшейк
+    # 2. TLS-хэндшейк для TLS-портов
     if not tls_check(host, port):
         return float('inf'), cfg
 
-    # 3. WS-проба только для WebSocket транспорта
+    # 3. Транспортная проба
     if proto in ('vless', 'vmess', 'trojan'):
         transport, path, sni = parse_transport(cfg)
         if transport == 'ws':
+            # WS-проба: нужен хоть какой-то HTTP ответ (101, 400, 403 — все OK)
+            # Если сервер не отвечает вообще — отбрасываем
             if not ws_probe(host, port, path, sni):
                 return float('inf'), cfg
+        # httpupgrade / grpc / tcp / reality — только TCP+TLS достаточно
 
     return avg, cfg
 
@@ -456,59 +477,89 @@ def build_best_subscription(sources: list):
 
 
 def upload_subscription(b64: str) -> str:
-    """Загружает подписку на хостинг и возвращает прямую ссылку."""
+    """
+    Загружает подписку на публичный хостинг и возвращает прямую ссылку.
+    Сервисы опробуются по очереди; возвращается первый успешный URL.
+    """
     content = b64.encode()
-    raw_url = ''
 
-    # 1. 0x0.st
+    # 1. paste.rs — надёжный, отдаёт сырой текст по прямой ссылке
     try:
-        r = requests.post('https://0x0.st',
-                          files={'file': ('sub.txt', content, 'text/plain')},
-                          timeout=12)
-        if r.status_code == 200 and r.text.strip().startswith('http'):
-            raw_url = r.text.strip()
+        r = requests.post('https://paste.rs/',
+                          data=content,
+                          headers={'Content-Type': 'text/plain'},
+                          timeout=15)
+        if r.status_code in (200, 201):
+            url = r.text.strip()
+            if url.startswith('http'):
+                return url
     except Exception:
         pass
 
-    # 2. transfer.sh
-    if not raw_url:
-        try:
-            r = requests.put('https://transfer.sh/HitRay.txt',
-                             data=content,
-                             headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
-                             timeout=12)
-            if r.status_code == 200 and r.text.strip().startswith('http'):
-                raw_url = r.text.strip()
-        except Exception:
-            pass
+    # 2. dpaste.org — европейский, хорошо доступен из РФ
+    try:
+        r = requests.post('https://dpaste.org/api/',
+                          data={'content': b64, 'lexer': 'text', 'expires': '3600'},
+                          timeout=15)
+        if r.status_code == 200:
+            url = r.text.strip().strip('"')
+            if url.startswith('http'):
+                # /XXXX → /XXXX/raw/
+                return url.rstrip('/') + '/raw/'
+    except Exception:
+        pass
 
-    # 3. hastebin
-    if not raw_url:
-        try:
-            r = requests.post('https://hastebin.com/documents',
-                              data=content,
-                              headers={'Content-Type': 'text/plain'},
-                              timeout=12)
-            if r.status_code == 200:
-                key = r.json().get('key', '')
-                if key:
-                    raw_url = f'https://hastebin.com/raw/{key}'
-        except Exception:
-            pass
+    # 3. ix.io — минималистичный paste, прямой URL
+    try:
+        r = requests.post('http://ix.io',
+                          data={'f:1': b64},
+                          timeout=15)
+        if r.status_code == 200:
+            url = r.text.strip()
+            if url.startswith('http'):
+                return url
+    except Exception:
+        pass
 
-    # 4. paste.rs
-    if not raw_url:
-        try:
-            r = requests.post('https://paste.rs/',
-                              data=content,
-                              headers={'Content-Type': 'text/plain'},
-                              timeout=12)
-            if r.status_code in (200, 201) and r.text.strip().startswith('http'):
-                raw_url = r.text.strip()
-        except Exception:
-            pass
+    # 4. hastebin.com
+    try:
+        r = requests.post('https://hastebin.com/documents',
+                          data=content,
+                          headers={'Content-Type': 'text/plain'},
+                          timeout=15)
+        if r.status_code == 200:
+            key = r.json().get('key', '')
+            if key:
+                return f'https://hastebin.com/raw/{key}'
+    except Exception:
+        pass
 
-    return raw_url
+    # 5. 0x0.st
+    try:
+        r = requests.post('https://0x0.st',
+                          files={'file': ('sub.txt', content, 'text/plain')},
+                          timeout=15)
+        if r.status_code == 200:
+            url = r.text.strip()
+            if url.startswith('http'):
+                return url
+    except Exception:
+        pass
+
+    # 6. transfer.sh
+    try:
+        r = requests.put('https://transfer.sh/HitRay.txt',
+                         data=content,
+                         headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
+                         timeout=15)
+        if r.status_code == 200:
+            url = r.text.strip()
+            if url.startswith('http'):
+                return url
+    except Exception:
+        pass
+
+    return ''
 
 
 # ─── Хэндлеры ────────────────────────────────────────────────────────────────
@@ -590,37 +641,36 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
     loop2 = asyncio.get_running_loop()
     url = await loop2.run_in_executor(None, upload_subscription, b64)
 
-    header = (
-        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по {SERVERS_PER_COUNTRY} сервера\n\n"
-        f"<b>Результаты:</b>\n{summary_text}\n\n"
-    )
-
     # Сохраняем в историю
-    loop3 = asyncio.get_running_loop()
-    await loop3.run_in_executor(
+    await loop2.run_in_executor(
         None, save_history, len(summary), len(summary) * SERVERS_PER_COUNTRY, url or ''
     )
 
+    header = (
+        f"✅ <b>Подписка готова</b> — {len(summary)} стран, "
+        f"по {SERVERS_PER_COUNTRY} сервера\n\n"
+        f"<b>Страны:</b>\n{summary_text}\n"
+    )
+
     if url:
+        # Основное сообщение с кратким описанием
         await cb.message.edit_text(
-            header + f"<code>{url}</code>\n\n"
-            "<i>Вставь ссылку в Happ как Subscription URL</i>",
+            header + "\n<b>Subscription URL для Happ ↓</b>\n"
+            "<i>(нажми на ссылку ниже, чтобы скопировать)</i>",
             parse_mode="HTML",
             reply_markup=kb_back_main()
         )
+        # Отдельное сообщение — только ссылка, plain text, легко копировать
+        await cb.message.answer(url, parse_mode=None)
     else:
-        # Резерв: отправить файлом если URL не получился
+        # Резерв: отправить файлом если ни один сервис не ответил
         await cb.message.edit_text(
-            header + "⚠️ Ссылку создать не удалось — отправляю файлом.",
+            header + "\n⚠️ Все сервисы недоступны — отправляю файлом.",
             parse_mode="HTML"
         )
         await cb.message.answer_document(
             types.BufferedInputFile(b64.encode(), filename='HitRay_subscription.txt'),
-            caption="<i>В Happ: нажми + → Импорт из файла</i>",
-            parse_mode="HTML"
-        )
-        await cb.message.edit_text(
-            header + "📎 Файл подписки отправлен выше.",
+            caption="📱 <b>Happ:</b> нажми <code>+</code> → <i>Импорт из файла</i>",
             parse_mode="HTML",
             reply_markup=kb_back_main()
         )

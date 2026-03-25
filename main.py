@@ -4,6 +4,9 @@ import base64
 import re
 import json
 import os
+import socket
+import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, types, F
@@ -17,19 +20,22 @@ TOKEN = os.getenv('BOT_TOKEN')
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
 HTTP_TIMEOUT = 6
+MAX_COUNTRIES = 5
+PING_TIMEOUT = 2.5
+MAX_PER_COUNTRY = 30  # сколько серверов одной страны пингуем
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 
-# ─── FSM ────────────────────────────────────────────────────────────────────
+# ─── FSM ─────────────────────────────────────────────────────────────────────
 
 class AddSource(StatesGroup):
     waiting_url = State()
 
 
-# ─── Источники ──────────────────────────────────────────────────────────────
+# ─── Источники ───────────────────────────────────────────────────────────────
 
 def load_sources() -> list:
     try:
@@ -45,21 +51,17 @@ def save_sources(sources: list):
 
 
 def validate_source(url: str) -> int:
-    """
-    Проверяет URL источника.
-    Возвращает количество найденных конфигов или 0 если ничего / ошибка.
-    """
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return 0
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
+        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\'<]+', resp.text)
         return len(found)
     except Exception:
         return 0
 
 
-# ─── Клавиатуры ─────────────────────────────────────────────────────────────
+# ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
 def kb_main():
     b = InlineKeyboardBuilder()
@@ -79,7 +81,6 @@ def kb_sources_menu():
 
 
 def kb_sources_list(sources: list, page: int = 0):
-    """Список источников с кнопками удаления, по 5 на страницу."""
     b = InlineKeyboardBuilder()
     per_page = 5
     start = page * per_page
@@ -90,7 +91,6 @@ def kb_sources_list(sources: list, page: int = 0):
         short = url.split('/')[-1][:35] or url[:35]
         b.button(text=f"🗑 {short}", callback_data=f"del_{idx}")
 
-    # Навигация
     total_pages = (len(sources) - 1) // per_page + 1
     nav = []
     if page > 0:
@@ -127,10 +127,13 @@ def kb_country():
     return b.as_markup()
 
 
-# ─── VPN логика ─────────────────────────────────────────────────────────────
+# ─── VPN логика ──────────────────────────────────────────────────────────────
 
 RU_KW = ['rus', '/ru_', 'ru_white', 'code=ru', 'kizyak']
 EU_KW = ['euro']
+
+# Стандартные флаги стран в виде эмодзи
+FLAG_MAP = {chr(0x1F1E6 + i): chr(ord('A') + i) for i in range(26)}
 
 
 def filter_sources(sources: list, country: str) -> list:
@@ -140,8 +143,172 @@ def filter_sources(sources: list, country: str) -> list:
     return [s for s in sources if any(k in s.lower() for k in kw)]
 
 
+def parse_config(config: str):
+    """Вернуть (host, port, remark) из URI конфига."""
+    remark = ''
+    body = config
+    if '#' in config:
+        body, tail = config.rsplit('#', 1)
+        remark = urllib.parse.unquote(tail)
+
+    try:
+        proto = body.split('://', 1)[0].lower()
+
+        if proto in ('vless', 'trojan'):
+            after = body.split('://', 1)[1]
+            host_port = after.split('@', 1)[1].split('?')[0].split('/')[0]
+            host, port_s = host_port.rsplit(':', 1)
+            return host.strip('[]'), int(port_s), remark
+
+        if proto == 'vmess':
+            b64 = body.split('://', 1)[1]
+            padded = b64 + '=' * (-len(b64) % 4)
+            data = json.loads(base64.b64decode(padded).decode('utf-8', errors='ignore'))
+            host = str(data.get('add', ''))
+            port = int(data.get('port', 443))
+            remark = remark or str(data.get('ps', ''))
+            return host, port, remark
+
+        if proto == 'ss':
+            after = body.split('://', 1)[1]
+            if '@' in after:
+                host_port = after.split('@', 1)[1].split('/')[0]
+                host, port_s = host_port.rsplit(':', 1)
+                return host.strip('[]'), int(port_s), remark
+            # Legacy base64
+            padded = after + '=' * (-len(after) % 4)
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+            host_port = decoded.split('@', 1)[1]
+            host, port_s = host_port.rsplit(':', 1)
+            return host.strip('[]'), int(port_s.split('/')[0]), remark
+    except Exception:
+        pass
+    return '', 0, remark
+
+
+def extract_country(remark: str) -> str:
+    """Извлечь двухбуквенный код страны из remark."""
+    # Флаг-эмодзи: пары региональных индикаторов
+    chars = list(remark)
+    i = 0
+    while i < len(chars) - 1:
+        a, b = chars[i], chars[i + 1]
+        if a in FLAG_MAP and b in FLAG_MAP:
+            return FLAG_MAP[a] + FLAG_MAP[b]
+        i += 1
+
+    # Скобочные паттерны: [RU], (DE), |FR|
+    m = re.search(r'[\[\(|]([A-Za-z]{2})[\]\)|]', remark)
+    if m:
+        return m.group(1).upper()
+
+    # Просто два заглавных в слове
+    SKIP = {'OK', 'NO', 'IS', 'DO', 'GO', 'TO', 'BE', 'OR', 'AS', 'IN', 'ON', 'AN'}
+    m = re.search(r'\b([A-Z]{2})\b', remark.upper())
+    if m and m.group(1) not in SKIP:
+        return m.group(1)
+
+    return 'XX'
+
+
+def tcp_ping(host: str, port: int) -> float:
+    """Латентность TCP-соединения в мс, или inf при ошибке."""
+    try:
+        t = time.perf_counter()
+        s = socket.create_connection((host, port), timeout=PING_TIMEOUT)
+        ms = (time.perf_counter() - t) * 1000
+        s.close()
+        return round(ms, 1)
+    except Exception:
+        return float('inf')
+
+
+def fetch_one(url: str) -> list:
+    try:
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 200:
+            # Захватываем весь URI включая #remark
+            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\'<]+', resp.text)
+    except Exception:
+        pass
+    return []
+
+
+def _ping_entry(entry):
+    """(config, host, port) → (latency, config)"""
+    cfg, host, port = entry
+    return tcp_ping(host, port), cfg
+
+
+def build_best_subscription(sources: list):
+    """
+    Возвращает (b64, summary).
+    summary = [(country, latency_ms), ...] — топ MAX_COUNTRIES стран.
+    1 самый быстрый сервер на страну.
+    """
+    # 1. Собираем все конфиги
+    all_configs = []
+    workers = max(1, len(sources))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for batch in ex.map(fetch_one, sources):
+            all_configs.extend(batch)
+
+    if not all_configs:
+        return '', []
+
+    # Дедупликация
+    all_configs = list(dict.fromkeys(all_configs))
+
+    # 2. Парсим и группируем по стране
+    by_country: dict[str, list] = {}
+    for cfg in all_configs:
+        host, port, remark = parse_config(cfg)
+        if not host or not port:
+            continue
+        country = extract_country(remark)
+        by_country.setdefault(country, []).append((cfg, host, port))
+
+    if not by_country:
+        return '', []
+
+    # 3. Для каждой страны пингуем серверы и берём лучший
+    ping_tasks = []
+    country_of = {}  # id(entry) → country
+    for country, entries in by_country.items():
+        for entry in entries[:MAX_PER_COUNTRY]:
+            ping_tasks.append(entry)
+            country_of[id(entry)] = country
+
+    # Параллельный пинг
+    entry_lat = {}  # entry → latency
+    with ThreadPoolExecutor(max_workers=min(100, len(ping_tasks))) as ex:
+        for entry, (lat, _) in zip(ping_tasks, ex.map(_ping_entry, ping_tasks)):
+            entry_lat[id(entry)] = (lat, entry[0])  # lat, config_str
+
+    # Лучший сервер на страну
+    best: dict[str, tuple] = {}  # country → (lat, config)
+    for entry in ping_tasks:
+        country = country_of[id(entry)]
+        lat, cfg = entry_lat[id(entry)]
+        if lat == float('inf'):
+            continue
+        if country not in best or lat < best[country][0]:
+            best[country] = (lat, cfg)
+
+    if not best:
+        return '', []
+
+    # 4. Топ MAX_COUNTRIES стран по латентности
+    ranked = sorted(best.items(), key=lambda x: x[1][0])[:MAX_COUNTRIES]
+
+    selected = [cfg for _, (_, cfg) in ranked]
+    summary = [(c, lat) for c, (lat, _) in ranked]
+
+    b64 = base64.b64encode('\n'.join(selected).encode()).decode()
+    return b64, summary
+
+
 def upload_subscription(b64: str) -> str:
-    """Загружает подписку на 0x0.st и возвращает URL."""
     try:
         resp = requests.post(
             'https://0x0.st',
@@ -154,30 +321,8 @@ def upload_subscription(b64: str) -> str:
         pass
     return ''
 
-def fetch_one(url: str) -> list:
-    try:
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
-        if resp.status_code == 200:
-            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
-    except Exception:
-        pass
-    return []
 
-
-def build_subscription(sources: list):
-    seen = set()
-    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
-        for configs in ex.map(fetch_one, sources):
-            for c in configs:
-                seen.add(c.strip())
-    configs = list(seen)
-    if not configs:
-        return '', 0
-    b64 = base64.b64encode('\n'.join(configs).encode()).decode()
-    return b64, len(configs)
-
-
-# ─── Хэндлеры ───────────────────────────────────────────────────────────────
+# ─── Хэндлеры ────────────────────────────────────────────────────────────────
 
 @dp.message(Command('start'))
 async def cmd_start(m: types.Message, state: FSMContext):
@@ -191,7 +336,6 @@ async def cmd_start(m: types.Message, state: FSMContext):
     )
 
 
-# Главное меню (по кнопке)
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -205,7 +349,7 @@ async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-# ── Получить подписку ────────────────────────────────────────────────────────
+# ── Получить подписку ─────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "get_sub")
 async def cb_get_sub(cb: types.CallbackQuery):
@@ -230,31 +374,41 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
         return
 
     await cb.answer()
-    await cb.message.edit_text("🔄 Собираю конфиги...")
+    await cb.message.edit_text(
+        "🔄 Собираю конфиги и тестирую серверы...\n"
+        "<i>(занимает ~15–30 сек)</i>",
+        parse_mode="HTML"
+    )
 
     loop = asyncio.get_running_loop()
-    b64, total = await loop.run_in_executor(None, build_subscription, sources)
+    b64, summary = await loop.run_in_executor(None, build_best_subscription, sources)
 
     if not b64:
         await cb.message.edit_text(
-            "⚠️ Конфигов не найдено. Попробуй другой регион.",
+            "⚠️ Живых серверов не найдено. Попробуй другой регион.",
             reply_markup=kb_country()
         )
         return
 
+    lines = [f"• {c} — {lat:.0f} мс" for c, lat in summary]
+    summary_text = "\n".join(lines)
+
     url = await loop.run_in_executor(None, upload_subscription, b64)
+    header = (
+        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по 1 серверу\n\n"
+        f"<b>Результаты:</b>\n{summary_text}\n\n"
+    )
+
     if url:
         await cb.message.edit_text(
-            f"✅ <b>Подписка готова</b> — {total} конфигов\n\n"
-            f"<code>{url}</code>\n\n"
+            header + f"<code>{url}</code>\n\n"
             "<i>Вставь ссылку в приложение как Subscription URL</i>",
             parse_mode="HTML",
             reply_markup=kb_back_main()
         )
     else:
-        # fallback — файл если хостинг недоступен
         await cb.message.edit_text(
-            f"✅ <b>Подписка готова</b> — {total} конфигов",
+            header + "Файл подписки во вложении 👇",
             parse_mode="HTML",
             reply_markup=kb_back_main()
         )
@@ -263,7 +417,7 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
         )
 
 
-# ── Меню источников ──────────────────────────────────────────────────────────
+# ── Меню источников ───────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "sources_menu")
 async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
@@ -277,7 +431,6 @@ async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-# Список источников
 @dp.callback_query(F.data.in_({"list_sources"}) | F.data.startswith("src_page_"))
 async def cb_list_sources(cb: types.CallbackQuery):
     await cb.answer()
@@ -294,9 +447,7 @@ async def cb_list_sources(cb: types.CallbackQuery):
         return
 
     markup, start, chunk, total_pages = kb_sources_list(sources, page)
-    lines = []
-    for i, url in enumerate(chunk):
-        lines.append(f"{start + i + 1}. <code>{url}</code>")
+    lines = [f"{start + i + 1}. <code>{url}</code>" for i, url in enumerate(chunk)]
 
     await cb.message.edit_text(
         f"📋 <b>Источники</b> (стр. {page + 1}/{total_pages})\n\n"
@@ -307,7 +458,6 @@ async def cb_list_sources(cb: types.CallbackQuery):
     )
 
 
-# Удаление источника
 @dp.callback_query(F.data.startswith("del_"))
 async def cb_delete_source(cb: types.CallbackQuery):
     idx = int(cb.data.split("_")[1])
@@ -321,8 +471,7 @@ async def cb_delete_source(cb: types.CallbackQuery):
     short = removed.split('/')[-1][:50] or removed[:50]
     await cb.answer(f"Удалён: {short}", show_alert=True)
 
-    # Обновляем список
-    page = max(0, (idx // 5))
+    page = max(0, idx // 5)
     if page * 5 >= len(sources) and page > 0:
         page -= 1
 
@@ -344,7 +493,6 @@ async def cb_delete_source(cb: types.CallbackQuery):
     )
 
 
-# Добавить источник — шаг 1: запрос URL
 @dp.callback_query(F.data == "add_source")
 async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddSource.waiting_url)
@@ -359,12 +507,10 @@ async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-# Добавить источник — шаг 2: получаем URL, валидируем
 @dp.message(AddSource.waiting_url)
 async def msg_add_source_url(m: types.Message, state: FSMContext):
     url = m.text.strip()
 
-    # Базовая проверка формата
     if not url.startswith(('http://', 'https://')):
         await m.answer(
             "⚠️ Ссылка должна начинаться с http:// или https://\n"
@@ -388,7 +534,6 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
         )
         return
 
-    # Проверяем дубликат
     sources = load_sources()
     if url in sources:
         await msg.edit_text(
@@ -412,7 +557,7 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
     )
 
 
-# ─── Запуск ─────────────────────────────────────────────────────────────────
+# ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def main():
     await dp.start_polling(bot)

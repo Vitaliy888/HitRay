@@ -273,30 +273,60 @@ def tls_check(host: str, port: int) -> bool:
         return False
 
 
-def http_probe(host: str, port: int) -> bool:
+def parse_transport(config: str) -> tuple[str, str, str]:
     """
-    Отправляет HTTP-запрос и ждёт любого ответа от сервера.
-    Даже HTTP 400/403 = VPN-процесс жив и отвечает.
-    Мёртвый сервер не ответит ничем → False.
+    Возвращает (transport, path, sni) из VLESS/VMess/Trojan URI.
+    transport: 'ws' | 'grpc' | 'tcp'
     """
+    transport, path, sni = 'tcp', '/', ''
+    try:
+        if '?' in config:
+            query = config.split('?', 1)[1].split('#')[0]
+            params = {}
+            for p in query.split('&'):
+                if '=' in p:
+                    k, v = p.split('=', 1)
+                    params[k.lower()] = urllib.parse.unquote(v)
+            transport = params.get('type', 'tcp').lower()
+            path = params.get('path', '/') or '/'
+            sni = params.get('sni', params.get('host', ''))
+    except Exception:
+        pass
+    return transport, path, sni
+
+
+def ws_probe(host: str, port: int, path: str = '/', sni: str = '') -> bool:
+    """
+    WebSocket-хэндшейк по конкретному пути из VLESS URI.
+    Ответ 101 Switching Protocols = WS-эндпоинт жив.
+    Ответ 400/403 = сервер ответил, но WS не поддерживается на этом пути.
+    Нет ответа = сервер мёртв → False.
+    """
+    effective_host = sni or host
     request = (
-        b'GET / HTTP/1.1\r\n'
-        b'Host: ' + host.encode() + b'\r\n'
-        b'Connection: close\r\n\r\n'
-    )
+        f'GET {path} HTTP/1.1\r\n'
+        f'Host: {effective_host}\r\n'
+        f'Upgrade: websocket\r\n'
+        f'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        f'Sec-WebSocket-Version: 13\r\n\r\n'
+    ).encode()
     try:
         if port in TLS_PORTS:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((host, port), timeout=PING_TIMEOUT) as raw:
-                with ctx.wrap_socket(raw, server_hostname=host) as s:
+                with ctx.wrap_socket(raw, server_hostname=effective_host) as s:
                     s.sendall(request)
-                    return len(s.recv(64)) > 0
+                    resp = s.recv(256).decode('utf-8', errors='ignore')
+                    # 101 = WS работает, любой другой HTTP ответ = сервер жив
+                    return resp.startswith('HTTP/')
         else:
             with socket.create_connection((host, port), timeout=PING_TIMEOUT) as s:
                 s.sendall(request)
-                return len(s.recv(64)) > 0
+                resp = s.recv(256).decode('utf-8', errors='ignore')
+                return resp.startswith('HTTP/')
     except Exception:
         return False
 
@@ -313,12 +343,13 @@ def fetch_one(url: str) -> list:
 
 def _ping_entry(entry):
     """
-    Трёхуровневая проверка сервера:
-      1. TCP-пинг × 2  — оба должны пройти (стабильность)
-      2. TLS-хэндшейк  — для TLS-портов (сертификат и шифрование живые)
-      3. HTTP-проба    — для vless/vmess/trojan: сервер должен ответить
-                         хоть чем-нибудь (даже 400 = VPN-процесс жив)
-    ss/shadowsocks: проверяется только TCP × 2, HTTP-проба пропускается.
+    Проверка сервера по уровням:
+      1. TCP-пинг × 2      — стабильность соединения
+      2. TLS-хэндшейк      — для TLS-портов
+      3. WS-хэндшейк       — только для vless/vmess/trojan с transport=ws:
+                             отправляем Upgrade: websocket на правильный path,
+                             ждём любого HTTP ответа (101/400/403 = жив)
+      ss/trojan(tcp):  только п.1 + п.2
     """
     cfg, host, port = entry
     proto = cfg.split('://', 1)[0].lower()
@@ -329,14 +360,16 @@ def _ping_entry(entry):
         return float('inf'), cfg
     avg = round(sum(results) / len(results), 1)
 
-    # 2. TLS-хэндшейк (443, 8443, ...)
+    # 2. TLS-хэндшейк
     if not tls_check(host, port):
         return float('inf'), cfg
 
-    # 3. HTTP-проба: реальный запрос — ждём любого ответа
+    # 3. WS-проба только для WebSocket транспорта
     if proto in ('vless', 'vmess', 'trojan'):
-        if not http_probe(host, port):
-            return float('inf'), cfg
+        transport, path, sni = parse_transport(cfg)
+        if transport == 'ws':
+            if not ws_probe(host, port, path, sni):
+                return float('inf'), cfg
 
     return avg, cfg
 

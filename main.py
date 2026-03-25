@@ -21,10 +21,11 @@ SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
-PING_TIMEOUT = 2.5
+PING_TIMEOUT = 2.0
 MAX_PER_COUNTRY = 50   # сколько серверов одной страны пингуем
 SERVERS_PER_COUNTRY = 3  # сколько лучших серверов берём в подписку
-MAX_PING_MS = 1500   # отсекаем серверы хуже этого порога
+MAX_PING_MS = 400    # только быстрые серверы (медленные = нерабочие)
+PING_ROUNDS = 2      # пингуем дважды — берём только стабильно отвечающие
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -264,9 +265,12 @@ def fetch_one(url: str) -> list:
 
 
 def _ping_entry(entry):
-    """(config, host, port) → (latency, config)"""
+    """(config, host, port) → (avg_latency, config); inf если хотя бы 1 попытка упала."""
     cfg, host, port = entry
-    return tcp_ping(host, port), cfg
+    results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
+    if any(r == float('inf') for r in results):
+        return float('inf'), cfg
+    return round(sum(results) / len(results), 1), cfg
 
 
 def build_best_subscription(sources: list):
@@ -288,12 +292,16 @@ def build_best_subscription(sources: list):
     # Дедупликация
     all_configs = list(dict.fromkeys(all_configs))
 
-    # 2. Парсим и группируем по стране
+    # 2. Парсим и группируем по стране; дедупликация по хосту
     by_country: dict[str, list] = {}
+    seen_hosts: set[str] = set()
     for cfg in all_configs:
         host, port, remark = parse_config(cfg)
         if not host or not port:
             continue
+        if host in seen_hosts:
+            continue
+        seen_hosts.add(host)
         country = extract_country(remark)
         by_country.setdefault(country, []).append((cfg, host, port))
 

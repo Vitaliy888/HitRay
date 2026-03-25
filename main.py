@@ -20,9 +20,11 @@ TOKEN = os.getenv('BOT_TOKEN')
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
 HTTP_TIMEOUT = 6
-MAX_COUNTRIES = 5
+MAX_COUNTRIES = 10
 PING_TIMEOUT = 2.5
-MAX_PER_COUNTRY = 30  # сколько серверов одной страны пингуем
+MAX_PER_COUNTRY = 50   # сколько серверов одной страны пингуем
+SERVERS_PER_COUNTRY = 3  # сколько лучших серверов берём в подписку
+MAX_PING_MS = 1500   # отсекаем серверы хуже этого порога
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -135,6 +137,26 @@ EU_KW = ['euro']
 # Стандартные флаги стран в виде эмодзи
 FLAG_MAP = {chr(0x1F1E6 + i): chr(ord('A') + i) for i in range(26)}
 
+# Русские названия стран → ISO-код
+RU_NAMES: dict[str, str] = {
+    'россия': 'RU', 'русь': 'RU',
+    'сербия': 'RS', 'польша': 'PL', 'франция': 'FR',
+    'германия': 'DE', 'нидерланды': 'NL', 'голландия': 'NL',
+    'швеция': 'SE', 'норвегия': 'NO', 'финляндия': 'FI',
+    'австрия': 'AT', 'швейцария': 'CH', 'чехия': 'CZ',
+    'румыния': 'RO', 'болгария': 'BG', 'венгрия': 'HU',
+    'словакия': 'SK', 'словения': 'SI', 'хорватия': 'HR',
+    'турция': 'TR', 'украина': 'UA', 'литва': 'LT',
+    'латвия': 'LV', 'эстония': 'EE', 'беларусь': 'BY',
+    'италия': 'IT', 'испания': 'ES', 'португалия': 'PT',
+    'великобритания': 'GB', 'британия': 'GB', 'англия': 'GB',
+    'сша': 'US', 'америка': 'US', 'япония': 'JP',
+    'китай': 'CN', 'сингапур': 'SG', 'австралия': 'AU',
+    'канада': 'CA', 'бразилия': 'BR', 'индия': 'IN',
+    'казахстан': 'KZ', 'молдова': 'MD', 'грузия': 'GE',
+    'армения': 'AM', 'азербайджан': 'AZ',
+}
+
 
 def filter_sources(sources: list, country: str) -> list:
     if country == 'all':
@@ -188,7 +210,7 @@ def parse_config(config: str):
 
 def extract_country(remark: str) -> str:
     """Извлечь двухбуквенный код страны из remark."""
-    # Флаг-эмодзи: пары региональных индикаторов
+    # 1. Флаг-эмодзи: пары региональных индикаторов
     chars = list(remark)
     i = 0
     while i < len(chars) - 1:
@@ -197,13 +219,20 @@ def extract_country(remark: str) -> str:
             return FLAG_MAP[a] + FLAG_MAP[b]
         i += 1
 
-    # Скобочные паттерны: [RU], (DE), |FR|
+    # 2. Русские названия стран
+    low = remark.lower()
+    for name, code in RU_NAMES.items():
+        if name in low:
+            return code
+
+    # 3. Скобочные паттерны: [RU], (DE), |FR|
     m = re.search(r'[\[\(|]([A-Za-z]{2})[\]\)|]', remark)
     if m:
         return m.group(1).upper()
 
-    # Просто два заглавных в слове
-    SKIP = {'OK', 'NO', 'IS', 'DO', 'GO', 'TO', 'BE', 'OR', 'AS', 'IN', 'ON', 'AN'}
+    # 4. Просто два заглавных в слове
+    SKIP = {'OK', 'NO', 'IS', 'DO', 'GO', 'TO', 'BE', 'OR', 'AS', 'IN', 'ON', 'AN',
+            'LT', 'LTE', 'GB', 'MB', 'IP', 'ID', 'SS', 'VL', 'VM', 'TG', 'UP'}
     m = re.search(r'\b([A-Z]{2})\b', remark.upper())
     if m and m.group(1) not in SKIP:
         return m.group(1)
@@ -244,7 +273,7 @@ def build_best_subscription(sources: list):
     """
     Возвращает (b64, summary).
     summary = [(country, latency_ms), ...] — топ MAX_COUNTRIES стран.
-    1 самый быстрый сервер на страну.
+    SERVERS_PER_COUNTRY серверов на страну.
     """
     # 1. Собираем все конфиги
     all_configs = []
@@ -271,7 +300,7 @@ def build_best_subscription(sources: list):
     if not by_country:
         return '', []
 
-    # 3. Для каждой страны пингуем серверы и берём лучший
+    # 3. Для каждой страны пингуем серверы
     ping_tasks = []
     country_of = {}  # id(entry) → country
     for country, entries in by_country.items():
@@ -280,29 +309,41 @@ def build_best_subscription(sources: list):
             country_of[id(entry)] = country
 
     # Параллельный пинг
-    entry_lat = {}  # id(entry) → (lat, config)
+    entry_lat = {}  # entry → latency
     with ThreadPoolExecutor(max_workers=min(100, len(ping_tasks))) as ex:
         for entry, (lat, _) in zip(ping_tasks, ex.map(_ping_entry, ping_tasks)):
-            entry_lat[id(entry)] = (lat, entry[0])
+            entry_lat[id(entry)] = (lat, entry[0])  # lat, config_str
 
-    # Лучший сервер на страну
-    best: dict[str, tuple] = {}  # country → (lat, config)
+    # Топ SERVERS_PER_COUNTRY серверов на страну (по возрастанию пинга)
+    country_servers: dict[str, list] = {}  # country → [(lat, config), ...]
     for entry in ping_tasks:
         country = country_of[id(entry)]
         lat, cfg = entry_lat[id(entry)]
-        if lat == float('inf'):
+        if lat == float('inf') or lat > MAX_PING_MS:
             continue
-        if country not in best or lat < best[country][0]:
-            best[country] = (lat, cfg)
+        country_servers.setdefault(country, []).append((lat, cfg))
 
-    if not best:
+    # Убираем XX если есть нормальные страны
+    if len(country_servers) > 1:
+        country_servers.pop('XX', None)
+
+    if not country_servers:
         return '', []
 
-    # 4. Топ MAX_COUNTRIES стран по латентности
-    ranked = sorted(best.items(), key=lambda x: x[1][0])[:MAX_COUNTRIES]
+    # Лучший пинг страны = минимум среди её серверов
+    country_best_lat = {c: min(lat for lat, _ in entries)
+                        for c, entries in country_servers.items()}
 
-    selected = [cfg for _, (_, cfg) in ranked]
-    summary = [(c, lat) for c, (lat, _) in ranked]
+    # 4. Топ MAX_COUNTRIES стран по минимальному пингу
+    top_countries = sorted(country_best_lat, key=lambda c: country_best_lat[c])[:MAX_COUNTRIES]
+
+    selected = []
+    summary = []
+    for country in top_countries:
+        servers = sorted(country_servers[country])[:SERVERS_PER_COUNTRY]
+        for lat, cfg in servers:
+            selected.append(cfg)
+        summary.append((country, servers[0][0]))
 
     b64 = base64.b64encode('\n'.join(selected).encode()).decode()
     return b64, summary
@@ -429,7 +470,7 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
 
     url = await loop.run_in_executor(None, upload_subscription, b64)
     header = (
-        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по 1 серверу\n\n"
+        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по {SERVERS_PER_COUNTRY} сервера\n\n"
         f"<b>Результаты:</b>\n{summary_text}\n\n"
     )
 

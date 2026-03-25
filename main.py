@@ -45,15 +45,11 @@ def save_sources(sources: list):
 
 
 def validate_source(url: str) -> int:
-    """
-    Проверяет URL источника.
-    Возвращает количество найденных конфигов или 0 если ничего / ошибка.
-    """
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return 0
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
+        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\' <]+', resp.text)
         return len(found)
     except Exception:
         return 0
@@ -79,7 +75,6 @@ def kb_sources_menu():
 
 
 def kb_sources_list(sources: list, page: int = 0):
-    """Список источников с кнопками удаления, по 5 на страницу."""
     b = InlineKeyboardBuilder()
     per_page = 5
     start = page * per_page
@@ -90,7 +85,6 @@ def kb_sources_list(sources: list, page: int = 0):
         short = url.split('/')[-1][:35] or url[:35]
         b.button(text=f"🗑 {short}", callback_data=f"del_{idx}")
 
-    # Навигация
     total_pages = (len(sources) - 1) // per_page + 1
     nav = []
     if page > 0:
@@ -141,7 +135,6 @@ def filter_sources(sources: list, country: str) -> list:
 
 
 def upload_subscription(b64: str) -> str:
-    """Загружает подписку на 0x0.st и возвращает URL."""
     try:
         resp = requests.post(
             'https://0x0.st',
@@ -154,11 +147,12 @@ def upload_subscription(b64: str) -> str:
         pass
     return ''
 
+
 def fetch_one(url: str) -> list:
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code == 200:
-            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\'<]+', resp.text)
+            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s#"\' <]+', resp.text)
     except Exception:
         pass
     return []
@@ -191,7 +185,6 @@ async def cmd_start(m: types.Message, state: FSMContext):
     )
 
 
-# Главное меню (по кнопке)
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -204,8 +197,6 @@ async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
         reply_markup=kb_main()
     )
 
-
-# ── Получить подписку ────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "get_sub")
 async def cb_get_sub(cb: types.CallbackQuery):
@@ -252,7 +243,6 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
             reply_markup=kb_back_main()
         )
     else:
-        # fallback — файл если хостинг недоступен
         await cb.message.edit_text(
             f"✅ <b>Подписка готова</b> — {total} конфигов",
             parse_mode="HTML",
@@ -262,8 +252,6 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
             types.BufferedInputFile(b64.encode(), filename="subscription.txt")
         )
 
-
-# ── Меню источников ──────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "sources_menu")
 async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
@@ -277,7 +265,6 @@ async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-# Список источников
 @dp.callback_query(F.data.in_({"list_sources"}) | F.data.startswith("src_page_"))
 async def cb_list_sources(cb: types.CallbackQuery):
     await cb.answer()
@@ -307,7 +294,6 @@ async def cb_list_sources(cb: types.CallbackQuery):
     )
 
 
-# Удаление источника
 @dp.callback_query(F.data.startswith("del_"))
 async def cb_delete_source(cb: types.CallbackQuery):
     idx = int(cb.data.split("_")[1])
@@ -321,7 +307,6 @@ async def cb_delete_source(cb: types.CallbackQuery):
     short = removed.split('/')[-1][:50] or removed[:50]
     await cb.answer(f"Удалён: {short}", show_alert=True)
 
-    # Обновляем список
     page = max(0, (idx // 5))
     if page * 5 >= len(sources) and page > 0:
         page -= 1
@@ -344,7 +329,6 @@ async def cb_delete_source(cb: types.CallbackQuery):
     )
 
 
-# Добавить источник — шаг 1: запрос URL
 @dp.callback_query(F.data == "add_source")
 async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddSource.waiting_url)
@@ -359,12 +343,10 @@ async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-# Добавить источник — шаг 2: получаем URL, валидируем
 @dp.message(AddSource.waiting_url)
 async def msg_add_source_url(m: types.Message, state: FSMContext):
     url = m.text.strip()
 
-    # Базовая проверка формата
     if not url.startswith(('http://', 'https://')):
         await m.answer(
             "⚠️ Ссылка должна начинаться с http:// или https://\n"
@@ -388,7 +370,6 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
         )
         return
 
-    # Проверяем дубликат
     sources = load_sources()
     if url in sources:
         await msg.edit_text(

@@ -309,16 +309,50 @@ def build_best_subscription(sources: list):
 
 
 def upload_subscription(b64: str) -> str:
+    content = b64.encode()
+
+    # 1. 0x0.st
     try:
-        resp = requests.post(
-            'https://0x0.st',
-            files={'file': ('sub.txt', b64.encode(), 'text/plain')},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.text.strip()
+        r = requests.post('https://0x0.st',
+                          files={'file': ('sub.txt', content, 'text/plain')},
+                          timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith('http'):
+            return r.text.strip()
     except Exception:
         pass
+
+    # 2. transfer.sh
+    try:
+        r = requests.put('https://transfer.sh/sub.txt',
+                         data=content,
+                         headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
+                         timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith('http'):
+            return r.text.strip()
+    except Exception:
+        pass
+
+    # 3. paste.rs
+    try:
+        r = requests.post('https://paste.rs/',
+                          data=content,
+                          headers={'Content-Type': 'text/plain'},
+                          timeout=12)
+        if r.status_code in (200, 201) and r.text.strip().startswith('http'):
+            return r.text.strip()
+    except Exception:
+        pass
+
+    # 4. ix.io
+    try:
+        r = requests.post('https://ix.io',
+                          data={'f:1': content},
+                          timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith('http'):
+            return r.text.strip()
+    except Exception:
+        pass
+
     return ''
 
 
@@ -408,12 +442,10 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
         )
     else:
         await cb.message.edit_text(
-            header + "Файл подписки во вложении 👇",
+            header + "⚠️ Не удалось загрузить подписку на хостинг.\n"
+            "Проверь соединение сервера с интернетом.",
             parse_mode="HTML",
             reply_markup=kb_back_main()
-        )
-        await cb.message.answer_document(
-            types.BufferedInputFile(b64.encode(), filename="subscription.txt")
         )
 
 

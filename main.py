@@ -18,8 +18,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from database import (
+    init_db, load_sources, add_source, remove_source_by_hash,
+    source_exists, sources_count, save_history, last_history, url_hash
+)
+
 TOKEN = os.getenv('BOT_TOKEN')
-SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
+
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))  # Telegram user_id владельца (0 = без ограничений)
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
@@ -44,19 +50,6 @@ class AddSource(StatesGroup):
 
 
 # ─── Источники ───────────────────────────────────────────────────────────────
-
-def load_sources() -> list:
-    try:
-        with open(SOURCES_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_sources(sources: list):
-    with open(SOURCES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(sources, f, ensure_ascii=False, indent=2)
-
 
 def validate_source(url: str) -> int:
     try:
@@ -93,23 +86,29 @@ def kb_sources_list(sources: list, page: int = 0):
     per_page = 5
     start = page * per_page
     chunk = sources[start:start + per_page]
+    total_pages = max(1, -(-len(sources) // per_page))  # ceiling division
 
-    for i, url in enumerate(chunk):
-        idx = start + i
-        short = url.split('/')[-1][:35] or url[:35]
-        b.button(text=f"🗑 {short}", callback_data=f"del_{idx}")
+    for url in chunk:
+        short = url.split('/')[-1][:32] or url[:32]
+        b.button(text=f"🗑 {short}", callback_data=f"del_{url_hash(url)}")
 
-    total_pages = (len(sources) - 1) // per_page + 1
     nav = []
     if page > 0:
-        nav.append(("◀️", f"src_page_{page - 1}"))
+        nav.append(("◀️ Пред.", f"src_page_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(("▶️", f"src_page_{page + 1}"))
+        nav.append(("▶️ След.", f"src_page_{page + 1}"))
     for text, cb in nav:
         b.button(text=text, callback_data=cb)
 
     b.button(text="🔙 Назад", callback_data="sources_menu")
-    b.adjust(1)
+
+    # Источники — по одному, навигация — в одну строку, «Назад» — отдельно
+    sizes = [1] * len(chunk)
+    if nav:
+        sizes.append(len(nav))
+    sizes.append(1)
+    b.adjust(*sizes)
+
     return b.as_markup(), start, chunk, total_pages
 
 
@@ -596,6 +595,12 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
         f"<b>Результаты:</b>\n{summary_text}\n\n"
     )
 
+    # Сохраняем в историю
+    loop3 = asyncio.get_running_loop()
+    await loop3.run_in_executor(
+        None, save_history, len(summary), len(summary) * SERVERS_PER_COUNTRY, url or ''
+    )
+
     if url:
         await cb.message.edit_text(
             header + f"<code>{url}</code>\n\n"
@@ -619,6 +624,29 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
             parse_mode="HTML",
             reply_markup=kb_back_main()
         )
+
+
+def _is_admin(user_id: int) -> bool:
+    return ADMIN_ID == 0 or user_id == ADMIN_ID
+
+
+# ── Статистика ────────────────────────────────────────────────────────────────
+
+@dp.message(Command('stats'))
+async def cmd_stats(m: types.Message):
+    cnt = sources_count()
+    rows = last_history(5)
+    lines = [f"📦 Источников: <b>{cnt}</b>\n"]
+    if rows:
+        lines.append("<b>Последние подписки:</b>")
+        for r in rows:
+            lines.append(
+                f"• {r['created_at']} — {r['country_count']} стран, "
+                f"{r['server_count']} серверов"
+            )
+    else:
+        lines.append("<i>История пуста</i>")
+    await m.answer('\n'.join(lines), parse_mode="HTML")
 
 
 # ── Меню источников ───────────────────────────────────────────────────────────
@@ -664,21 +692,19 @@ async def cb_list_sources(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_"))
 async def cb_delete_source(cb: types.CallbackQuery):
-    idx = int(cb.data.split("_")[1])
-    sources = load_sources()
-    if idx >= len(sources):
+    if not _is_admin(cb.from_user.id):
+        await cb.answer("Нет прав.", show_alert=True)
+        return
+    h = cb.data[4:]  # 8-символьный хеш URL
+    removed = remove_source_by_hash(h)
+    if not removed:
         await cb.answer("Источник уже удалён.", show_alert=True)
         return
 
-    removed = sources.pop(idx)
-    save_sources(sources)
     short = removed.split('/')[-1][:50] or removed[:50]
     await cb.answer(f"Удалён: {short}", show_alert=True)
 
-    page = max(0, idx // 5)
-    if page * 5 >= len(sources) and page > 0:
-        page -= 1
-
+    sources = load_sources()
     if not sources:
         await cb.message.edit_text(
             "📋 Источников нет. Добавьте первый!",
@@ -686,10 +712,10 @@ async def cb_delete_source(cb: types.CallbackQuery):
         )
         return
 
-    markup, start, chunk, total_pages = kb_sources_list(sources, page)
+    markup, start, chunk, total_pages = kb_sources_list(sources, 0)
     lines = [f"{start + i + 1}. <code>{url}</code>" for i, url in enumerate(chunk)]
     await cb.message.edit_text(
-        f"📋 <b>Источники</b> (стр. {page + 1}/{total_pages})\n\n"
+        f"📋 <b>Источники</b> (стр. 1/{total_pages})\n\n"
         + "\n".join(lines)
         + "\n\n<i>Нажми на источник чтобы удалить его</i>",
         parse_mode="HTML",
@@ -699,6 +725,9 @@ async def cb_delete_source(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data == "add_source")
 async def cb_add_source(cb: types.CallbackQuery, state: FSMContext):
+    if not _is_admin(cb.from_user.id):
+        await cb.answer("Нет прав.", show_alert=True)
+        return
     await state.set_state(AddSource.waiting_url)
     await cb.answer()
     await cb.message.edit_text(
@@ -738,8 +767,7 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
         )
         return
 
-    sources = load_sources()
-    if url in sources:
+    if source_exists(url):
         await msg.edit_text(
             "ℹ️ Этот источник уже есть в списке.",
             reply_markup=kb_sources_menu()
@@ -747,15 +775,14 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    sources.append(url)
-    save_sources(sources)
+    add_source(url, cfg_count=count)
     await state.clear()
 
     await msg.edit_text(
         f"✅ <b>Источник добавлен!</b>\n\n"
         f"<code>{url}</code>\n\n"
         f"Найдено конфигов: <b>{count}</b>\n"
-        f"Всего источников: <b>{len(sources)}</b>",
+        f"Всего источников: <b>{sources_count()}</b>",
         parse_mode="HTML",
         reply_markup=kb_sources_menu()
     )
@@ -764,6 +791,7 @@ async def msg_add_source_url(m: types.Message, state: FSMContext):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def main():
+    init_db()
     await dp.start_polling(bot)
 
 

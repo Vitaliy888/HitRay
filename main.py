@@ -117,7 +117,42 @@ def kb_back_main():
     return b.as_markup()
 
 
+def kb_country():
+    b = InlineKeyboardBuilder()
+    b.button(text="🇷🇺 Россия", callback_data="sub_ru")
+    b.button(text="🌍 Европа",  callback_data="sub_eu")
+    b.button(text="🌐 Все",     callback_data="sub_all")
+    b.button(text="🔙 Назад",   callback_data="main_menu")
+    b.adjust(3, 1)
+    return b.as_markup()
+
+
 # ─── VPN логика ─────────────────────────────────────────────────────────────
+
+RU_KW = ['rus', '/ru_', 'ru_white', 'code=ru', 'kizyak']
+EU_KW = ['euro']
+
+
+def filter_sources(sources: list, country: str) -> list:
+    if country == 'all':
+        return sources
+    kw = RU_KW if country == 'ru' else EU_KW
+    return [s for s in sources if any(k in s.lower() for k in kw)]
+
+
+def upload_subscription(b64: str) -> str:
+    """Загружает подписку на 0x0.st и возвращает URL."""
+    try:
+        resp = requests.post(
+            'https://0x0.st',
+            files={'file': ('sub.txt', b64.encode(), 'text/plain')},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.text.strip()
+    except Exception:
+        pass
+    return ''
 
 def fetch_one(url: str) -> list:
     try:
@@ -178,26 +213,54 @@ async def cb_get_sub(cb: types.CallbackQuery):
     if not sources:
         await cb.answer("Нет источников! Добавьте хотя бы один.", show_alert=True)
         return
+    await cb.answer()
+    await cb.message.edit_text(
+        "🌍 <b>Выбери регион</b>",
+        parse_mode="HTML",
+        reply_markup=kb_country()
+    )
+
+
+@dp.callback_query(F.data.startswith("sub_"))
+async def cb_get_sub_country(cb: types.CallbackQuery):
+    country = cb.data[4:]  # ru / eu / all
+    sources = filter_sources(load_sources(), country)
+    if not sources:
+        await cb.answer("Нет источников для этого региона.", show_alert=True)
+        return
 
     await cb.answer()
-    await cb.message.edit_text("🔄 Собираю конфиги из источников...")
+    await cb.message.edit_text("🔄 Собираю конфиги...")
 
     loop = asyncio.get_running_loop()
     b64, total = await loop.run_in_executor(None, build_subscription, sources)
 
     if not b64:
         await cb.message.edit_text(
-            "⚠️ Конфигов не найдено. Проверь источники и попробуй снова.",
-            reply_markup=kb_back_main()
+            "⚠️ Конфигов не найдено. Попробуй другой регион.",
+            reply_markup=kb_country()
         )
         return
 
-    await cb.message.edit_text(
-        f"✅ <b>Подписка готова</b>\n\nСкопируй строку ниже в приложение:",
-        parse_mode="HTML",
-        reply_markup=kb_back_main()
-    )
-    await cb.message.answer(f"<code>{b64}</code>", parse_mode="HTML")
+    url = await loop.run_in_executor(None, upload_subscription, b64)
+    if url:
+        await cb.message.edit_text(
+            f"✅ <b>Подписка готова</b> — {total} конфигов\n\n"
+            f"<code>{url}</code>\n\n"
+            "<i>Вставь ссылку в приложение как Subscription URL</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_main()
+        )
+    else:
+        # fallback — файл если хостинг недоступен
+        await cb.message.edit_text(
+            f"✅ <b>Подписка готова</b> — {total} конфигов",
+            parse_mode="HTML",
+            reply_markup=kb_back_main()
+        )
+        await cb.message.answer_document(
+            types.BufferedInputFile(b64.encode(), filename="subscription.txt")
+        )
 
 
 # ── Меню источников ──────────────────────────────────────────────────────────

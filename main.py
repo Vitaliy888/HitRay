@@ -30,7 +30,7 @@ MAX_PING_MS = 600    # фильтр по пингу (мс)
 PING_ROUNDS = 2      # пингуем дважды — берём только стабильно отвечающие
 
 # Порты с TLS — на них делаем хэндшейк для реальной проверки
-TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096, 2053}
+TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -63,7 +63,7 @@ def validate_source(url: str) -> int:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return 0
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\'<]+', resp.text)
+        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', resp.text)
         return len(found)
     except Exception:
         return 0
@@ -277,8 +277,7 @@ def fetch_one(url: str) -> list:
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code == 200:
-            # Захватываем весь URI включая #remark
-            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\'<]+', resp.text)
+            return re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', resp.text)
     except Exception:
         pass
     return []
@@ -302,7 +301,7 @@ def build_best_subscription(sources: list):
     """
     Возвращает (b64, summary).
     summary = [(country, latency_ms), ...] — топ MAX_COUNTRIES стран.
-    1 самый быстрый сервер на страну.
+    SERVERS_PER_COUNTRY серверов на страну.
     """
     # 1. Собираем все конфиги
     all_configs = []
@@ -333,7 +332,7 @@ def build_best_subscription(sources: list):
     if not by_country:
         return '', []
 
-    # 3. Для каждой страны пингуем серверы и берём лучший
+    # 3. Для каждой страны пингуем серверы
     ping_tasks = []
     country_of = {}  # id(entry) → country
     for country, entries in by_country.items():
@@ -342,13 +341,13 @@ def build_best_subscription(sources: list):
             country_of[id(entry)] = country
 
     # Параллельный пинг
-    entry_lat = {}  # entry → latency
+    entry_lat = {}
     with ThreadPoolExecutor(max_workers=min(100, len(ping_tasks))) as ex:
         for entry, (lat, _) in zip(ping_tasks, ex.map(_ping_entry, ping_tasks)):
-            entry_lat[id(entry)] = (lat, entry[0])  # lat, config_str
+            entry_lat[id(entry)] = (lat, entry[0])
 
-    # Топ SERVERS_PER_COUNTRY серверов на страну (по возрастанию пинга)
-    country_servers: dict[str, list] = {}  # country → [(lat, config), ...]
+    # Топ SERVERS_PER_COUNTRY серверов на страну
+    country_servers: dict[str, list] = {}
     for entry in ping_tasks:
         country = country_of[id(entry)]
         lat, cfg = entry_lat[id(entry)]
@@ -363,11 +362,9 @@ def build_best_subscription(sources: list):
     if not country_servers:
         return '', []
 
-    # Лучший пинг страны = минимум среди её серверов
     country_best_lat = {c: min(lat for lat, _ in entries)
                         for c, entries in country_servers.items()}
 
-    # 4. Топ MAX_COUNTRIES стран по минимальному пингу
     top_countries = sorted(country_best_lat, key=lambda c: country_best_lat[c])[:MAX_COUNTRIES]
 
     selected = []
@@ -384,8 +381,6 @@ def build_best_subscription(sources: list):
 
 async def send_subscription_file(message: types.Message, b64: str, caption: str):
     """Отправляет подписку прямо как файл в Telegram."""
-    buf = BytesIO(b64.encode())
-    buf.name = 'HitRay_subscription.txt'
     await message.answer_document(
         types.BufferedInputFile(b64.encode(), filename='HitRay_subscription.txt'),
         caption=caption,
@@ -399,7 +394,7 @@ async def send_subscription_file(message: types.Message, b64: str, caption: str)
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
     await m.answer(
-        "👋 <b>VlessFlow</b>\n\n"
+        "👋 <b>HitRay</b>\n\n"
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
@@ -412,7 +407,7 @@ async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
     await cb.message.edit_text(
-        "👋 <b>VlessFlow</b>\n\n"
+        "👋 <b>HitRay</b>\n\n"
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
@@ -471,7 +466,7 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
     )
 
     await cb.message.edit_text(
-        f"✅ <b>Готово!</b> Отправляю файл подписки...",
+        "✅ <b>Готово!</b> Отправляю файл подписки...",
         parse_mode="HTML"
     )
     await send_subscription_file(cb.message, b64, caption)

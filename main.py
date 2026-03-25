@@ -24,7 +24,7 @@ MAX_COUNTRIES = 10
 PING_TIMEOUT = 2.0
 MAX_PER_COUNTRY = 50   # сколько серверов одной страны пингуем
 SERVERS_PER_COUNTRY = 3  # сколько лучших серверов берём в подписку
-MAX_PING_MS = 400    # только быстрые серверы (медленные = нерабочие)
+MAX_PING_MS = 250    # только быстрые серверы (медленные = нерабочие)
 PING_ROUNDS = 2      # пингуем дважды — берём только стабильно отвечающие
 
 bot = Bot(token=TOKEN)
@@ -349,8 +349,11 @@ def build_best_subscription(sources: list):
     summary = []
     for country in top_countries:
         servers = sorted(country_servers[country])[:SERVERS_PER_COUNTRY]
-        for lat, cfg in servers:
-            selected.append(cfg)
+        for i, (lat, cfg) in enumerate(servers):
+            # Убираем старый remark и ставим HitRay-XX или HitRay-XX-2, HitRay-XX-3
+            base = cfg.rsplit('#', 1)[0] if '#' in cfg else cfg
+            suffix = f'-{i + 1}' if i > 0 else ''
+            selected.append(f'{base}#HitRay-{country}{suffix}')
         summary.append((country, servers[0][0]))
 
     b64 = base64.b64encode('\n'.join(selected).encode()).decode()
@@ -372,7 +375,7 @@ def upload_subscription(b64: str) -> str:
 
     # 2. transfer.sh
     try:
-        r = requests.put('https://transfer.sh/sub.txt',
+        r = requests.put('https://transfer.sh/HitRay.txt',
                          data=content,
                          headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
                          timeout=12)
@@ -411,7 +414,7 @@ def upload_subscription(b64: str) -> str:
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
     await m.answer(
-        "👋 <b>VlessFlow</b>\n\n"
+        "👋 <b>HitRay</b>\n\n"
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
@@ -424,7 +427,7 @@ async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
     await cb.message.edit_text(
-        "👋 <b>VlessFlow</b>\n\n"
+        "👋 <b>HitRay</b>\n\n"
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
@@ -478,7 +481,8 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
 
     url = await loop.run_in_executor(None, upload_subscription, b64)
     header = (
-        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по {SERVERS_PER_COUNTRY} сервера\n\n"
+        f"✅ <b>HitRay — подписка готова</b>\n"
+        f"{len(summary)} стран · {SERVERS_PER_COUNTRY} сервера на страну\n\n"
         f"<b>Результаты:</b>\n{summary_text}\n\n"
     )
 

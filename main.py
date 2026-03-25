@@ -5,9 +5,11 @@ import re
 import json
 import os
 import socket
+import ssl
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -21,11 +23,14 @@ SOURCES_FILE = os.path.join(os.path.dirname(__file__), 'sources.json')
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
-PING_TIMEOUT = 2.0
+PING_TIMEOUT = 3.0
 MAX_PER_COUNTRY = 50   # сколько серверов одной страны пингуем
-SERVERS_PER_COUNTRY = 3  # сколько лучших серверов берём в подписку
-MAX_PING_MS = 250    # только быстрые серверы (медленные = нерабочие)
+SERVERS_PER_COUNTRY = 5  # сколько лучших серверов берём в подписку
+MAX_PING_MS = 600    # фильтр по пингу (мс)
 PING_ROUNDS = 2      # пингуем дважды — берём только стабильно отвечающие
+
+# Порты с TLS — на них делаем хэндшейк для реальной проверки
+TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -253,6 +258,21 @@ def tcp_ping(host: str, port: int) -> float:
         return float('inf')
 
 
+def tls_check(host: str, port: int) -> bool:
+    """Проверяет TLS-хэндшейк. Для не-TLS портов всегда True."""
+    if port not in TLS_PORTS:
+        return True
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=PING_TIMEOUT) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except Exception:
+        return False
+
+
 def fetch_one(url: str) -> list:
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
@@ -264,12 +284,17 @@ def fetch_one(url: str) -> list:
 
 
 def _ping_entry(entry):
-    """(config, host, port) → (avg_latency, config); inf если хотя бы 1 попытка упала."""
+    """(config, host, port) → (avg_latency, config); inf если сервер не прошёл проверку."""
     cfg, host, port = entry
+    # 1. TCP-пинг дважды — оба должны успешно ответить
     results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
     if any(r == float('inf') for r in results):
         return float('inf'), cfg
-    return round(sum(results) / len(results), 1), cfg
+    avg = round(sum(results) / len(results), 1)
+    # 2. TLS-хэндшейк (для портов 443/8443/и т.д.) — обязателен
+    if not tls_check(host, port):
+        return float('inf'), cfg
+    return avg, cfg
 
 
 def build_best_subscription(sources: list):
@@ -354,52 +379,13 @@ def build_best_subscription(sources: list):
     return b64, summary
 
 
-def upload_subscription(b64: str) -> str:
-    content = b64.encode()
-
-    # 1. 0x0.st
-    try:
-        r = requests.post('https://0x0.st',
-                          files={'file': ('sub.txt', content, 'text/plain')},
-                          timeout=12)
-        if r.status_code == 200 and r.text.strip().startswith('http'):
-            return r.text.strip()
-    except Exception:
-        pass
-
-    # 2. transfer.sh
-    try:
-        r = requests.put('https://transfer.sh/HitRay.txt',
-                         data=content,
-                         headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
-                         timeout=12)
-        if r.status_code == 200 and r.text.strip().startswith('http'):
-            return r.text.strip()
-    except Exception:
-        pass
-
-    # 3. paste.rs
-    try:
-        r = requests.post('https://paste.rs/',
-                          data=content,
-                          headers={'Content-Type': 'text/plain'},
-                          timeout=12)
-        if r.status_code in (200, 201) and r.text.strip().startswith('http'):
-            return r.text.strip()
-    except Exception:
-        pass
-
-    # 4. ix.io
-    try:
-        r = requests.post('https://ix.io',
-                          data={'f:1': content},
-                          timeout=12)
-        if r.status_code == 200 and r.text.strip().startswith('http'):
-            return r.text.strip()
-    except Exception:
-        pass
-
-    return ''
+async def send_subscription_file(message: types.Message, b64: str, caption: str):
+    """Отправляет подписку прямо как файл в Telegram."""
+    await message.answer_document(
+        types.BufferedInputFile(b64.encode(), filename='HitRay_subscription.txt'),
+        caption=caption,
+        parse_mode="HTML"
+    )
 
 
 # ─── Хэндлеры ────────────────────────────────────────────────────────────────
@@ -473,27 +459,24 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
     lines = [f"• {c} — {lat:.0f} мс" for c, lat in summary]
     summary_text = "\n".join(lines)
 
-    url = await loop.run_in_executor(None, upload_subscription, b64)
-    header = (
-        f"✅ <b>HitRay — подписка готова</b>\n"
-        f"{len(summary)} стран · {SERVERS_PER_COUNTRY} сервера на страну\n\n"
-        f"<b>Результаты:</b>\n{summary_text}\n\n"
+    caption = (
+        f"✅ <b>Подписка готова</b>\n\n"
+        f"<b>Страны ({len(summary)}):</b>\n{summary_text}\n\n"
+        f"<i>Импортируй файл в Happ: Профиль → Добавить → Импорт из файла</i>"
     )
 
-    if url:
-        await cb.message.edit_text(
-            header + f"<code>{url}</code>\n\n"
-            "<i>Вставь ссылку в приложение как Subscription URL</i>",
-            parse_mode="HTML",
-            reply_markup=kb_back_main()
-        )
-    else:
-        await cb.message.edit_text(
-            header + "⚠️ Не удалось загрузить подписку на хостинг.\n"
-            "Проверь соединение сервера с интернетом.",
-            parse_mode="HTML",
-            reply_markup=kb_back_main()
-        )
+    await cb.message.edit_text(
+        "✅ <b>Готово!</b> Отправляю файл подписки...",
+        parse_mode="HTML"
+    )
+    await send_subscription_file(cb.message, b64, caption)
+    await cb.message.edit_text(
+        f"✅ <b>Подписка отправлена файлом выше</b>\n\n"
+        f"<b>Страны ({len(summary)}):</b>\n{summary_text}\n\n"
+        f"<i>В Happ: нажми + → Импорт из файла → выбери файл</i>",
+        parse_mode="HTML",
+        reply_markup=kb_back_main()
+    )
 
 
 # ── Меню источников ───────────────────────────────────────────────────────────

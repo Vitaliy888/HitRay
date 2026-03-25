@@ -52,8 +52,19 @@ def validate_source(url: str) -> int:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return 0
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', resp.text)
-        return len(found)
+        text = resp.text.strip()
+        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        if found:
+            return len(found)
+        # Пробуем base64-подписку
+        try:
+            padded = text + '=' * (-len(text) % 4)
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            return len(found)
+        except Exception:
+            pass
+        return 0
     except Exception:
         return 0
 
@@ -387,67 +398,47 @@ def build_best_subscription(sources: list):
 
 def upload_subscription(b64: str) -> str:
     """
-    Загружает подписку на публичный хостинг и возвращает прямую ссылку.
-    Сервисы опробуются по очереди; возвращается первый успешный URL.
+    Загружает подписку на хостинг и возвращает прямую ссылку на raw-контент.
+    Сервисы протестированы на доступность — нерабочие убраны.
     """
     content = b64.encode()
 
-    # 1. paste.rs — надёжный, отдаёт сырой текст по прямой ссылке
+    # 1. pastefy.app — API возвращает готовый raw_url, проверен
     try:
-        r = requests.post('https://paste.rs/',
-                          data=content,
-                          headers={'Content-Type': 'text/plain'},
-                          timeout=15)
-        if r.status_code in (200, 201):
+        r = requests.post(
+            'https://pastefy.app/api/v2/paste',
+            json={'content': b64, 'type': 'PASTE'},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            raw_url = r.json().get('paste', {}).get('raw_url', '')
+            if raw_url:
+                return raw_url
+    except Exception:
+        pass
+
+    # 2. catbox.moe — файл-хостинг, прямая ссылка на файл
+    try:
+        r = requests.post(
+            'https://catbox.moe/user/api.php',
+            data={'reqtype': 'fileupload', 'userhash': ''},
+            files={'fileToUpload': ('sub.txt', content, 'text/plain')},
+            timeout=15,
+        )
+        if r.status_code == 200:
             url = r.text.strip()
-            if url.startswith('http'):
+            if url.startswith('https://files.catbox.moe/'):
                 return url
     except Exception:
         pass
 
-    # 2. dpaste.org — европейский, хорошо доступен из РФ
+    # 3. 0x0.st — запасной
     try:
-        r = requests.post('https://dpaste.org/api/',
-                          data={'content': b64, 'lexer': 'text', 'expires': '3600'},
-                          timeout=15)
-        if r.status_code == 200:
-            url = r.text.strip().strip('"')
-            if url.startswith('http'):
-                # /XXXX → /XXXX/raw/
-                return url.rstrip('/') + '/raw/'
-    except Exception:
-        pass
-
-    # 3. ix.io — минималистичный paste, прямой URL
-    try:
-        r = requests.post('http://ix.io',
-                          data={'f:1': b64},
-                          timeout=15)
-        if r.status_code == 200:
-            url = r.text.strip()
-            if url.startswith('http'):
-                return url
-    except Exception:
-        pass
-
-    # 4. hastebin.com
-    try:
-        r = requests.post('https://hastebin.com/documents',
-                          data=content,
-                          headers={'Content-Type': 'text/plain'},
-                          timeout=15)
-        if r.status_code == 200:
-            key = r.json().get('key', '')
-            if key:
-                return f'https://hastebin.com/raw/{key}'
-    except Exception:
-        pass
-
-    # 5. 0x0.st
-    try:
-        r = requests.post('https://0x0.st',
-                          files={'file': ('sub.txt', content, 'text/plain')},
-                          timeout=15)
+        r = requests.post(
+            'https://0x0.st',
+            files={'file': ('sub.txt', content, 'text/plain')},
+            timeout=15,
+        )
         if r.status_code == 200:
             url = r.text.strip()
             if url.startswith('http'):
@@ -455,12 +446,14 @@ def upload_subscription(b64: str) -> str:
     except Exception:
         pass
 
-    # 6. transfer.sh
+    # 4. transfer.sh — запасной
     try:
-        r = requests.put('https://transfer.sh/HitRay.txt',
-                         data=content,
-                         headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
-                         timeout=15)
+        r = requests.put(
+            'https://transfer.sh/HitRay.txt',
+            data=content,
+            headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
+            timeout=15,
+        )
         if r.status_code == 200:
             url = r.text.strip()
             if url.startswith('http'):

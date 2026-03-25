@@ -25,7 +25,7 @@ HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
 PING_TIMEOUT = 3.0
 MAX_PER_COUNTRY = 50   # сколько серверов одной страны пингуем
-SERVERS_PER_COUNTRY = 5  # сколько лучших серверов берём в подписку
+SERVERS_PER_COUNTRY = 2  # сколько лучших серверов берём в подписку
 MAX_PING_MS = 600    # фильтр по пингу (мс)
 PING_ROUNDS = 2      # пингуем дважды — берём только стабильно отвечающие
 
@@ -273,6 +273,34 @@ def tls_check(host: str, port: int) -> bool:
         return False
 
 
+def http_probe(host: str, port: int) -> bool:
+    """
+    Отправляет HTTP-запрос и ждёт любого ответа от сервера.
+    Даже HTTP 400/403 = VPN-процесс жив и отвечает.
+    Мёртвый сервер не ответит ничем → False.
+    """
+    request = (
+        b'GET / HTTP/1.1\r\n'
+        b'Host: ' + host.encode() + b'\r\n'
+        b'Connection: close\r\n\r\n'
+    )
+    try:
+        if port in TLS_PORTS:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as raw:
+                with ctx.wrap_socket(raw, server_hostname=host) as s:
+                    s.sendall(request)
+                    return len(s.recv(64)) > 0
+        else:
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as s:
+                s.sendall(request)
+                return len(s.recv(64)) > 0
+    except Exception:
+        return False
+
+
 def fetch_one(url: str) -> list:
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=HTTP_TIMEOUT)
@@ -284,16 +312,32 @@ def fetch_one(url: str) -> list:
 
 
 def _ping_entry(entry):
-    """(config, host, port) → (avg_latency, config); inf если сервер не прошёл проверку."""
+    """
+    Трёхуровневая проверка сервера:
+      1. TCP-пинг × 2  — оба должны пройти (стабильность)
+      2. TLS-хэндшейк  — для TLS-портов (сертификат и шифрование живые)
+      3. HTTP-проба    — для vless/vmess/trojan: сервер должен ответить
+                         хоть чем-нибудь (даже 400 = VPN-процесс жив)
+    ss/shadowsocks: проверяется только TCP × 2, HTTP-проба пропускается.
+    """
     cfg, host, port = entry
-    # 1. TCP-пинг дважды — оба должны успешно ответить
+    proto = cfg.split('://', 1)[0].lower()
+
+    # 1. TCP-пинг дважды
     results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
     if any(r == float('inf') for r in results):
         return float('inf'), cfg
     avg = round(sum(results) / len(results), 1)
-    # 2. TLS-хэндшейк (для портов 443/8443/и т.д.) — обязателен
+
+    # 2. TLS-хэндшейк (443, 8443, ...)
     if not tls_check(host, port):
         return float('inf'), cfg
+
+    # 3. HTTP-проба: реальный запрос — ждём любого ответа
+    if proto in ('vless', 'vmess', 'trojan'):
+        if not http_probe(host, port):
+            return float('inf'), cfg
+
     return avg, cfg
 
 
@@ -379,13 +423,60 @@ def build_best_subscription(sources: list):
     return b64, summary
 
 
-async def send_subscription_file(message: types.Message, b64: str, caption: str):
-    """Отправляет подписку прямо как файл в Telegram."""
-    await message.answer_document(
-        types.BufferedInputFile(b64.encode(), filename='HitRay_subscription.txt'),
-        caption=caption,
-        parse_mode="HTML"
-    )
+def upload_subscription(b64: str) -> str:
+    """Загружает подписку на хостинг и возвращает прямую ссылку."""
+    content = b64.encode()
+    raw_url = ''
+
+    # 1. 0x0.st
+    try:
+        r = requests.post('https://0x0.st',
+                          files={'file': ('sub.txt', content, 'text/plain')},
+                          timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith('http'):
+            raw_url = r.text.strip()
+    except Exception:
+        pass
+
+    # 2. transfer.sh
+    if not raw_url:
+        try:
+            r = requests.put('https://transfer.sh/HitRay.txt',
+                             data=content,
+                             headers={'Content-Type': 'text/plain', 'Max-Days': '3'},
+                             timeout=12)
+            if r.status_code == 200 and r.text.strip().startswith('http'):
+                raw_url = r.text.strip()
+        except Exception:
+            pass
+
+    # 3. hastebin
+    if not raw_url:
+        try:
+            r = requests.post('https://hastebin.com/documents',
+                              data=content,
+                              headers={'Content-Type': 'text/plain'},
+                              timeout=12)
+            if r.status_code == 200:
+                key = r.json().get('key', '')
+                if key:
+                    raw_url = f'https://hastebin.com/raw/{key}'
+        except Exception:
+            pass
+
+    # 4. paste.rs
+    if not raw_url:
+        try:
+            r = requests.post('https://paste.rs/',
+                              data=content,
+                              headers={'Content-Type': 'text/plain'},
+                              timeout=12)
+            if r.status_code in (200, 201) and r.text.strip().startswith('http'):
+                raw_url = r.text.strip()
+        except Exception:
+            pass
+
+    return raw_url
 
 
 # ─── Хэндлеры ────────────────────────────────────────────────────────────────
@@ -459,24 +550,42 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
     lines = [f"• {c} — {lat:.0f} мс" for c, lat in summary]
     summary_text = "\n".join(lines)
 
-    caption = (
-        f"✅ <b>Подписка готова</b>\n\n"
-        f"<b>Страны ({len(summary)}):</b>\n{summary_text}\n\n"
-        f"<i>Импортируй файл в Happ: Профиль → Добавить → Импорт из файла</i>"
-    )
-
     await cb.message.edit_text(
-        "✅ <b>Готово!</b> Отправляю файл подписки...",
+        "✅ <b>Серверы найдены!</b> Загружаю подписку...",
         parse_mode="HTML"
     )
-    await send_subscription_file(cb.message, b64, caption)
-    await cb.message.edit_text(
-        f"✅ <b>Подписка отправлена файлом выше</b>\n\n"
-        f"<b>Страны ({len(summary)}):</b>\n{summary_text}\n\n"
-        f"<i>В Happ: нажми + → Импорт из файла → выбери файл</i>",
-        parse_mode="HTML",
-        reply_markup=kb_back_main()
+
+    loop2 = asyncio.get_running_loop()
+    url = await loop2.run_in_executor(None, upload_subscription, b64)
+
+    header = (
+        f"✅ <b>Подписка готова</b> — {len(summary)} стран, по {SERVERS_PER_COUNTRY} сервера\n\n"
+        f"<b>Результаты:</b>\n{summary_text}\n\n"
     )
+
+    if url:
+        await cb.message.edit_text(
+            header + f"<code>{url}</code>\n\n"
+            "<i>Вставь ссылку в Happ как Subscription URL</i>",
+            parse_mode="HTML",
+            reply_markup=kb_back_main()
+        )
+    else:
+        # Резерв: отправить файлом если URL не получился
+        await cb.message.edit_text(
+            header + "⚠️ Ссылку создать не удалось — отправляю файлом.",
+            parse_mode="HTML"
+        )
+        await cb.message.answer_document(
+            types.BufferedInputFile(b64.encode(), filename='HitRay_subscription.txt'),
+            caption="<i>В Happ: нажми + → Импорт из файла</i>",
+            parse_mode="HTML"
+        )
+        await cb.message.edit_text(
+            header + "📎 Файл подписки отправлен выше.",
+            parse_mode="HTML",
+            reply_markup=kb_back_main()
+        )
 
 
 # ── Меню источников ───────────────────────────────────────────────────────────

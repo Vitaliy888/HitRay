@@ -1,10 +1,12 @@
 import asyncio
+import ipaddress
 import requests
 import base64
 import re
 import json
 import os
 import socket
+import ssl
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -19,12 +21,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import (
     init_db, load_sources, add_source, remove_source_by_hash,
-    source_exists, sources_count, save_history, last_history, url_hash
+    source_exists, sources_count, save_history, last_history, url_hash,
+    get_alive_configs, save_config_results, configs_alive_count,
+    configs_cache_age_minutes, save_discovered_source, get_discovered_sources,
+    mark_discovered_added,
 )
 
 TOKEN = os.getenv('BOT_TOKEN')
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')   # необязателен, но снимает rate-limit
 
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))  # Telegram user_id владельца (0 = без ограничений)
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
@@ -131,20 +137,15 @@ def kb_back_main():
     return b.as_markup()
 
 
-def kb_country():
+def kb_discover_add():
     b = InlineKeyboardBuilder()
-    b.button(text="🇷🇺 Россия", callback_data="sub_ru")
-    b.button(text="🌍 Европа",  callback_data="sub_eu")
-    b.button(text="🌐 Все",     callback_data="sub_all")
-    b.button(text="🔙 Назад",   callback_data="main_menu")
-    b.adjust(3, 1)
+    b.button(text="➕ Добавить все найденные", callback_data="discover_add_all")
+    b.button(text="🔙 Главное меню", callback_data="main_menu")
+    b.adjust(1)
     return b.as_markup()
 
 
 # ─── VPN логика ──────────────────────────────────────────────────────────────
-
-RU_KW = ['rus', '/ru_', 'ru_white', 'code=ru', 'kizyak']
-EU_KW = ['euro']
 
 # Стандартные флаги стран в виде эмодзи
 FLAG_MAP = {chr(0x1F1E6 + i): chr(ord('A') + i) for i in range(26)}
@@ -169,12 +170,6 @@ RU_NAMES: dict[str, str] = {
     'армения': 'AM', 'азербайджан': 'AZ',
 }
 
-
-def filter_sources(sources: list, country: str) -> list:
-    if country == 'all':
-        return sources
-    kw = RU_KW if country == 'ru' else EU_KW
-    return [s for s in sources if any(k in s.lower() for k in kw)]
 
 
 def parse_config(config: str):
@@ -264,6 +259,89 @@ def tcp_ping(host: str, port: int) -> float:
         return float('inf')
 
 
+# ─── CDN-детектор ────────────────────────────────────────────────────────────
+
+# Официальные IP-диапазоны Cloudflare (https://www.cloudflare.com/ips/)
+_CF_RANGES = [ipaddress.ip_network(r) for r in [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15',
+    '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+]]
+
+
+def is_cdn_ip(host: str) -> bool:
+    """True если host — IP из CDN-диапазона (Cloudflare и др.)."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return any(ip in net for net in _CF_RANGES)
+    except ValueError:
+        # Это доменное имя — резолвим
+        try:
+            resolved = socket.gethostbyname(host)
+            ip = ipaddress.ip_address(resolved)
+            return any(ip in net for net in _CF_RANGES)
+        except Exception:
+            return False
+
+
+# ─── Транспортный парсер ──────────────────────────────────────────────────────
+
+def parse_transport(config: str) -> tuple[str, str, str]:
+    """Возвращает (transport, path, sni) из параметров URI."""
+    transport, path, sni = 'tcp', '/', ''
+    try:
+        if '?' in config:
+            query = config.split('?', 1)[1].split('#')[0]
+            params = {}
+            for p in query.split('&'):
+                if '=' in p:
+                    k, v = p.split('=', 1)
+                    params[k.lower()] = urllib.parse.unquote(v)
+            transport = params.get('type', 'tcp').lower()
+            path = params.get('path', '/') or '/'
+            sni = params.get('sni', params.get('host', ''))
+    except Exception:
+        pass
+    return transport, path, sni
+
+
+# ─── WS-проба ─────────────────────────────────────────────────────────────────
+
+_TLS_PORTS = {443, 8443, 2053, 2083, 2087, 2096}
+
+
+def ws_probe(host: str, port: int, path: str = '/', sni: str = '') -> bool:
+    """
+    Отправляет WebSocket Upgrade на конкретный path с правильным SNI.
+    101 / 400 / 403 = сервер (или CDN) ответил → маршрутизация работает.
+    Нет ответа / обрыв = сервер мёртв или CDN не знает куда роутить → False.
+    """
+    effective_host = sni or host
+    request = (
+        f'GET {path} HTTP/1.1\r\n'
+        f'Host: {effective_host}\r\n'
+        f'Upgrade: websocket\r\n'
+        f'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        f'Sec-WebSocket-Version: 13\r\n\r\n'
+    ).encode()
+    try:
+        if port in _TLS_PORTS:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as raw:
+                with ctx.wrap_socket(raw, server_hostname=effective_host) as s:
+                    s.sendall(request)
+                    return s.recv(16).startswith(b'HTTP/')
+        else:
+            with socket.create_connection((host, port), timeout=PING_TIMEOUT) as s:
+                s.sendall(request)
+                return s.recv(16).startswith(b'HTTP/')
+    except Exception:
+        return False
+
 
 def fetch_one(url: str) -> list:
     """Скачать конфиги из источника. Поддерживает сырой текст и base64-подписки."""
@@ -294,16 +372,23 @@ def fetch_one(url: str) -> list:
 
 def _ping_entry(entry):
     """
-    Проверка сервера: два TCP-замера, берём лучший.
+    Многоуровневая проверка сервера:
 
-    Почему только TCP:
-    - VLESS+Reality: сервер ожидает браузерный TLS-фингерпринт (uTLS).
-      Python ssl не подходит → TLS-хэндшейк падает, хотя сервер живой.
-    - VLESS+WS за CDN (Cloudflare): WS-апгрейд без авторизации отклоняется CDN.
-      Happ при этом подключается нормально через VLESS-поверх-WS.
-    Итог: TLS и WS-проба давали 60-80% ложных отказов, убраны.
+    1. TCP-пинг (×2, берём лучший) — обязателен для всех.
+
+    2. WS-проба — ТОЛЬКО для transport=ws/httpupgrade.
+       Эти конфиги идут через CDN (Cloudflare), который ВСЕГДА отвечает на
+       TCP. Значит TCP-пинг — ложный «живой». Нужно проверить, что CDN
+       реально маршрутизирует запрос к бэкенду.
+       Ответ 101/400/403 (любой HTTP) = маршрут работает → сервер жив.
+       Нет ответа / обрыв = CDN не знает бэкенд → отбрасываем.
+
+    3. Reality/TCP/gRPC — только TCP-пинг. Прямой IP, пинг надёжен.
+       WS-проба для них ломалась (они не говорят WebSocket).
     """
     cfg, host, port = entry
+
+    # 1. TCP-пинг
     results = [tcp_ping(host, port) for _ in range(PING_ROUNDS)]
     good = [r for r in results if r < float('inf')]
     if not good:
@@ -311,30 +396,71 @@ def _ping_entry(entry):
     best = min(good)
     if best > MAX_PING_MS:
         return float('inf'), cfg
+
+    # 2. WS-проба для CDN-конфигов
+    proto = cfg.split('://', 1)[0].lower()
+    if proto in ('vless', 'vmess', 'trojan'):
+        transport, path, sni = parse_transport(cfg)
+        if transport in ('ws', 'httpupgrade'):
+            if not ws_probe(host, port, path, sni):
+                return float('inf'), cfg
+
     return best, cfg
+
+
+def _finish_subscription(country_servers: dict) -> tuple:
+    """Собрать b64-подписку и summary из dict {country: [(lat, cfg), ...]}."""
+    if len(country_servers) > 1:
+        country_servers.pop('XX', None)
+    if not country_servers:
+        return '', []
+
+    best_lat = {c: min(l for l, _ in v) for c, v in country_servers.items()}
+    top = sorted(best_lat, key=best_lat.get)[:MAX_COUNTRIES]
+
+    selected, summary = [], []
+    for country in top:
+        servers = sorted(country_servers[country])[:SERVERS_PER_COUNTRY]
+        selected.extend(cfg for _, cfg in servers)
+        summary.append((country, servers[0][0]))
+
+    b64 = base64.b64encode('\n'.join(selected).encode()).decode()
+    return b64, summary
 
 
 def build_best_subscription(sources: list):
     """
     Возвращает (b64, summary).
-    summary = [(country, latency_ms), ...] — топ MAX_COUNTRIES стран.
-    SERVERS_PER_COUNTRY серверов на страну.
+
+    Логика:
+      1. Если в БД есть ≥15 живых конфигов младше 45 мин — отдаём из кэша
+         (ответ за ~1 сек вместо 30–60 сек).
+      2. Иначе: полный прогон — качаем источники, пингуем, сохраняем в БД.
     """
-    # 1. Собираем все конфиги
-    all_configs = []
-    workers = max(1, len(sources))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # ── Шаг 1: кэш ──────────────────────────────────────────────────────────
+    cached = get_alive_configs(max_age_min=45)
+    if len(cached) >= 15:
+        country_servers: dict[str, list] = {}
+        for row in cached:
+            country_servers.setdefault(row['country'], []).append(
+                (row['ping_ms'], row['cfg'])
+            )
+        return _finish_subscription(country_servers)
+
+    # ── Шаг 2: полный сбор ──────────────────────────────────────────────────
+    all_configs: list[str] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(sources))) as ex:
         for batch in ex.map(fetch_one, sources):
             all_configs.extend(batch)
 
     if not all_configs:
         return '', []
 
-    # Дедупликация
     all_configs = list(dict.fromkeys(all_configs))
 
-    # 2. Парсим и группируем по стране; дедупликация по хосту
+    # Парсим, группируем по стране; дедупликация по хосту
     by_country: dict[str, list] = {}
+    cfg_meta: dict[str, tuple] = {}   # cfg → (host, port, country, transport)
     seen_hosts: set[str] = set()
     for cfg in all_configs:
         host, port, remark = parse_config(cfg)
@@ -344,56 +470,50 @@ def build_best_subscription(sources: list):
             continue
         seen_hosts.add(host)
         country = extract_country(remark)
+        proto = cfg.split('://', 1)[0].lower()
+        transport = 'tcp'
+        if proto in ('vless', 'vmess', 'trojan'):
+            transport, _, _ = parse_transport(cfg)
+        cfg_meta[cfg] = (host, port, country, transport)
         by_country.setdefault(country, []).append((cfg, host, port))
 
     if not by_country:
         return '', []
 
-    # 3. Для каждой страны пингуем серверы
-    ping_tasks = []
-    country_of = {}  # id(entry) → country
-    for country, entries in by_country.items():
-        for entry in entries[:MAX_PER_COUNTRY]:
-            ping_tasks.append(entry)
-            country_of[id(entry)] = country
-
     # Параллельный пинг
-    entry_lat = {}
+    ping_tasks = [
+        entry
+        for entries in by_country.values()
+        for entry in entries[:MAX_PER_COUNTRY]
+    ]
+    cfg_lat: dict[str, float] = {}
     with ThreadPoolExecutor(max_workers=min(100, len(ping_tasks))) as ex:
-        for entry, (lat, _) in zip(ping_tasks, ex.map(_ping_entry, ping_tasks)):
-            entry_lat[id(entry)] = (lat, entry[0])
+        for (cfg, _, __), (lat, _) in zip(ping_tasks, ex.map(_ping_entry, ping_tasks)):
+            cfg_lat[cfg] = lat
 
-    # Топ SERVERS_PER_COUNTRY серверов на страну
-    country_servers: dict[str, list] = {}
-    for entry in ping_tasks:
-        country = country_of[id(entry)]
-        lat, cfg = entry_lat[id(entry)]
+    # ── Шаг 3: сохраняем все результаты в БД ────────────────────────────────
+    db_rows = []
+    for cfg, host, port in ping_tasks:
+        lat = cfg_lat.get(cfg, float('inf'))
+        alive = 1 if 0 < lat <= MAX_PING_MS else 0
+        _, _, country, transport = cfg_meta[cfg]
+        db_rows.append((
+            cfg, host, port, country, transport,
+            lat if alive else None,
+            alive, ''
+        ))
+    save_config_results(db_rows)
+
+    # ── Шаг 4: собираем подписку ─────────────────────────────────────────────
+    country_servers = {}
+    for cfg, host, port in ping_tasks:
+        lat = cfg_lat.get(cfg, float('inf'))
         if lat == float('inf') or lat > MAX_PING_MS:
             continue
+        country = cfg_meta[cfg][2]
         country_servers.setdefault(country, []).append((lat, cfg))
 
-    # Убираем XX если есть нормальные страны
-    if len(country_servers) > 1:
-        country_servers.pop('XX', None)
-
-    if not country_servers:
-        return '', []
-
-    country_best_lat = {c: min(lat for lat, _ in entries)
-                        for c, entries in country_servers.items()}
-
-    top_countries = sorted(country_best_lat, key=lambda c: country_best_lat[c])[:MAX_COUNTRIES]
-
-    selected = []
-    summary = []
-    for country in top_countries:
-        servers = sorted(country_servers[country])[:SERVERS_PER_COUNTRY]
-        for lat, cfg in servers:
-            selected.append(cfg)
-        summary.append((country, servers[0][0]))
-
-    b64 = base64.b64encode('\n'.join(selected).encode()).decode()
-    return b64, summary
+    return _finish_subscription(country_servers)
 
 
 def upload_subscription(b64: str) -> str:
@@ -464,6 +584,101 @@ def upload_subscription(b64: str) -> str:
     return ''
 
 
+# ─── GitHub Discovery ─────────────────────────────────────────────────────────
+
+# Поисковые запросы к GitHub Repositories API
+_GH_QUERIES = [
+    'vless vmess subscription configs vpn',
+    'free vless reality configs subscription',
+    'vless subscription txt vpn free',
+]
+
+# Типичные имена файлов с конфигами в репозиториях
+_KNOWN_PATHS = [
+    'sub.txt', 'subscription.txt', 'configs.txt', 'config.txt',
+    'vless.txt', 'vmess.txt', 'free.txt', 'proxy.txt', 'vpn.txt',
+]
+
+
+def discover_github_sources(max_results: int = 30) -> list[tuple[str, str, int]]:
+    """
+    Ищет источники VPN-конфигов на GitHub через Repositories Search API.
+
+    Алгоритм:
+      1. Ищем репозитории по ключевым словам.
+      2. Для каждого репо получаем список файлов в корне (contents API).
+      3. Валидируем .txt-файлы через validate_source().
+      4. Сохраняем новые источники в таблицу discovered_sources.
+
+    Возвращает список (raw_url, repo_name, cfg_count) — только новые.
+    """
+    headers = {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'HitRay-Bot/1.0',
+    }
+    if GITHUB_TOKEN:
+        headers['Authorization'] = f'Bearer {GITHUB_TOKEN}'
+
+    found_repos: dict[str, str] = {}   # full_name → default_branch
+
+    for query in _GH_QUERIES:
+        if len(found_repos) >= 20:
+            break
+        try:
+            r = requests.get(
+                'https://api.github.com/search/repositories',
+                params={'q': query, 'sort': 'updated', 'order': 'desc', 'per_page': 10},
+                headers=headers,
+                timeout=10,
+            )
+            if r.status_code == 403:
+                break   # rate limit
+            if r.status_code == 200:
+                for repo in r.json().get('items', []):
+                    name = repo['full_name']
+                    branch = repo.get('default_branch', 'main')
+                    found_repos[name] = branch
+            time.sleep(3)   # GitHub: 10 req/min без токена
+        except Exception:
+            pass
+
+    results: list[tuple[str, str, int]] = []
+
+    for repo, branch in found_repos.items():
+        if len(results) >= max_results:
+            break
+
+        # Получаем список файлов в корне репо
+        candidate_paths = list(_KNOWN_PATHS)
+        try:
+            r = requests.get(
+                f'https://api.github.com/repos/{repo}/contents/',
+                headers=headers,
+                timeout=8,
+            )
+            if r.status_code == 200:
+                for item in r.json():
+                    if (item.get('type') == 'file'
+                            and item['name'].endswith('.txt')
+                            and item['name'] not in candidate_paths):
+                        candidate_paths.append(item['name'])
+        except Exception:
+            pass
+
+        # Проверяем каждый кандидат
+        for fname in candidate_paths:
+            raw_url = f'https://raw.githubusercontent.com/{repo}/{branch}/{fname}'
+            count = validate_source(raw_url)
+            if count > 0:
+                is_new = save_discovered_source(raw_url, repo, count)
+                if is_new:
+                    results.append((raw_url, repo, count))
+
+        time.sleep(1)
+
+    return results
+
+
 # ─── Хэндлеры ────────────────────────────────────────────────────────────────
 
 @dp.message(Command('start'))
@@ -499,26 +714,14 @@ async def cb_get_sub(cb: types.CallbackQuery):
     if not sources:
         await cb.answer("Нет источников! Добавьте хотя бы один.", show_alert=True)
         return
-    await cb.answer()
-    await cb.message.edit_text(
-        "🌍 <b>Выбери регион</b>",
-        parse_mode="HTML",
-        reply_markup=kb_country()
-    )
-
-
-@dp.callback_query(F.data.startswith("sub_"))
-async def cb_get_sub_country(cb: types.CallbackQuery):
-    country = cb.data[4:]  # ru / eu / all
-    sources = filter_sources(load_sources(), country)
-    if not sources:
-        await cb.answer("Нет источников для этого региона.", show_alert=True)
-        return
 
     await cb.answer()
+    # Показываем разное сообщение в зависимости от наличия кэша
+    from database import get_alive_configs
+    has_cache = len(get_alive_configs(max_age_min=45)) >= 15
     await cb.message.edit_text(
-        "🔄 Собираю конфиги и тестирую серверы...\n"
-        "<i>(занимает ~15–30 сек)</i>",
+        "⚡ Загружаю из кэша..." if has_cache
+        else "🔄 Собираю конфиги и тестирую серверы...\n<i>(занимает ~30–60 сек)</i>",
         parse_mode="HTML"
     )
 
@@ -527,8 +730,8 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
 
     if not b64:
         await cb.message.edit_text(
-            "⚠️ Живых серверов не найдено. Попробуй другой регион.",
-            reply_markup=kb_country()
+            "⚠️ Живых серверов не найдено. Попробуйте позже или добавьте новые источники.",
+            reply_markup=kb_back_main()
         )
         return
 
@@ -582,13 +785,40 @@ def _is_admin(user_id: int) -> bool:
     return ADMIN_ID == 0 or user_id == ADMIN_ID
 
 
+@dp.callback_query(F.data == "discover_add_all")
+async def cb_discover_add_all(cb: types.CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await cb.answer("Нет прав.", show_alert=True)
+        return
+    await cb.answer()
+    pending = get_discovered_sources(only_new=True)
+    added = 0
+    for row in pending:
+        if add_source(row['url'], row['cfg_count']):
+            mark_discovered_added(row['url'])
+            added += 1
+    await cb.message.edit_text(
+        f"✅ Добавлено <b>{added}</b> новых источников.\n"
+        f"Всего источников: <b>{sources_count()}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_back_main()
+    )
+
+
 # ── Статистика ────────────────────────────────────────────────────────────────
 
 @dp.message(Command('stats'))
 async def cmd_stats(m: types.Message):
     cnt = sources_count()
+    alive = configs_alive_count()
+    age = configs_cache_age_minutes()
     rows = last_history(5)
-    lines = [f"📦 Источников: <b>{cnt}</b>\n"]
+
+    cache_info = (
+        f"🗄 Кэш: <b>{alive}</b> живых конфигов"
+        + (f", обновлён <b>{age:.0f} мин</b> назад" if alive else " (пуст)")
+    )
+    lines = [f"📦 Источников: <b>{cnt}</b>", cache_info, ""]
     if rows:
         lines.append("<b>Последние подписки:</b>")
         for r in rows:
@@ -599,6 +829,50 @@ async def cmd_stats(m: types.Message):
     else:
         lines.append("<i>История пуста</i>")
     await m.answer('\n'.join(lines), parse_mode="HTML")
+
+
+@dp.message(Command('cache_reset'))
+async def cmd_cache_reset(m: types.Message):
+    """Сбросить кэш — следующий запрос выполнит полный прогон."""
+    if not _is_admin(m.from_user.id):
+        return
+    from database import _conn, DB_FILE
+    import sqlite3
+    with sqlite3.connect(DB_FILE) as con:
+        con.execute("UPDATE configs SET alive = 0")
+    await m.answer("🗑 Кэш сброшен. Следующая подписка пересоберёт всё заново.")
+
+
+@dp.message(Command('discover'))
+async def cmd_discover(m: types.Message):
+    """Найти новые источники на GitHub и показать список."""
+    if not _is_admin(m.from_user.id):
+        return
+    msg = await m.answer("🔍 Ищу источники на GitHub...")
+    loop = asyncio.get_running_loop()
+    new = await loop.run_in_executor(None, discover_github_sources)
+
+    if not new:
+        # Покажем уже найденные ранее
+        pending = get_discovered_sources(only_new=True)
+        if pending:
+            lines = [f"ℹ️ Новых не найдено. Ранее найденные ({len(pending)}):\n"]
+            for row in pending[:10]:
+                lines.append(f"• <code>{row['url']}</code>\n  {row['repo']} — {row['cfg_count']} конфигов")
+            await msg.edit_text('\n'.join(lines), parse_mode="HTML",
+                                reply_markup=kb_discover_add())
+        else:
+            await msg.edit_text("😕 Ничего не найдено. Попробуйте позже.")
+        return
+
+    lines = [f"✅ Найдено <b>{len(new)}</b> новых источников:\n"]
+    for url, repo, cnt in new[:10]:
+        lines.append(f"• <code>{url}</code>\n  {repo} — {cnt} конфигов")
+    if len(new) > 10:
+        lines.append(f"\n… и ещё {len(new) - 10}")
+
+    await msg.edit_text('\n'.join(lines), parse_mode="HTML",
+                        reply_markup=kb_discover_add())
 
 
 # ── Меню источников ───────────────────────────────────────────────────────────

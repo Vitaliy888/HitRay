@@ -24,7 +24,8 @@ from database import (
 
 TOKEN = os.getenv('BOT_TOKEN')
 
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))  # Telegram user_id владельца (0 = без ограничений)
+_admin_id_env = os.getenv('ADMIN_ID', '')
+ADMIN_ID = int(_admin_id_env) if _admin_id_env.isdigit() else -1  # Telegram user_id владельца (-1 = не задан)
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
@@ -71,10 +72,11 @@ def validate_source(url: str) -> int:
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
-def kb_main():
+def kb_main(user_id: int = None):
     b = InlineKeyboardBuilder()
     b.button(text="📥 Получить подписку", callback_data="get_sub")
-    b.button(text="⚙️ Управление источниками", callback_data="sources_menu")
+    if user_id and _is_admin(user_id):
+        b.button(text="⚙️ Управление источниками", callback_data="sources_menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -474,7 +476,7 @@ async def cmd_start(m: types.Message, state: FSMContext):
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
-        reply_markup=kb_main()
+        reply_markup=kb_main(m.from_user.id)
     )
 
 
@@ -487,7 +489,7 @@ async def cb_main_menu(cb: types.CallbackQuery, state: FSMContext):
         "Собираю рабочие VPN-серверы из открытых источников, "
         "проверяю доступность и группирую по странам.",
         parse_mode="HTML",
-        reply_markup=kb_main()
+        reply_markup=kb_main(cb.from_user.id)
     )
 
 
@@ -579,13 +581,15 @@ async def cb_get_sub_country(cb: types.CallbackQuery):
 
 
 def _is_admin(user_id: int) -> bool:
-    return ADMIN_ID == 0 or user_id == ADMIN_ID
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
 
 
 # ── Статистика ────────────────────────────────────────────────────────────────
 
 @dp.message(Command('stats'))
 async def cmd_stats(m: types.Message):
+    if not _is_admin(m.from_user.id):
+        return
     cnt = sources_count()
     rows = last_history(5)
     lines = [f"📦 Источников: <b>{cnt}</b>\n"]
@@ -605,6 +609,8 @@ async def cmd_stats(m: types.Message):
 
 @dp.callback_query(F.data == "sources_menu")
 async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
+    if not _is_admin(cb.from_user.id):
+        return await cb.answer("Нет прав.", show_alert=True)
     await state.clear()
     await cb.answer()
     sources = load_sources()
@@ -617,6 +623,8 @@ async def cb_sources_menu(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.in_({"list_sources"}) | F.data.startswith("src_page_"))
 async def cb_list_sources(cb: types.CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        return await cb.answer("Нет прав.", show_alert=True)
     await cb.answer()
     page = 0
     if cb.data.startswith("src_page_"):

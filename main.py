@@ -8,7 +8,6 @@ import socket
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command

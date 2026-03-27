@@ -53,14 +53,14 @@ def validate_source(url: str) -> int:
         if resp.status_code != 200:
             return 0
         text = resp.text.strip()
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        found = RE_CONFIG_LINK.findall(text)
         if found:
             return len(found)
         # Пробуем base64-подписку
         try:
             padded = text + '=' * (-len(text) % 4)
             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            found = RE_CONFIG_LINK.findall(decoded)
             return len(found)
         except Exception:
             pass
@@ -142,6 +142,10 @@ def kb_country():
 
 
 # ─── VPN логика ──────────────────────────────────────────────────────────────
+
+RE_CONFIG_LINK = re.compile(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+')
+RE_COUNTRY_BRACKETS = re.compile(r'[\[\(|]([A-Za-z]{2})[\]\)|]')
+RE_COUNTRY_ISO = re.compile(r'\b([A-Z]{2})\b')
 
 RU_KW = ['rus', '/ru_', 'ru_white', 'code=ru', 'kizyak']
 EU_KW = ['euro']
@@ -238,14 +242,14 @@ def extract_country(remark: str) -> str:
             return code
 
     # 3. Скобочные паттерны: [RU], (DE), |FR|
-    m = re.search(r'[\[\(|]([A-Za-z]{2})[\]\)|]', remark)
+    m = RE_COUNTRY_BRACKETS.search(remark)
     if m:
         return m.group(1).upper()
 
     # 4. Просто два заглавных в слове
     SKIP = {'OK', 'NO', 'IS', 'DO', 'GO', 'TO', 'BE', 'OR', 'AS', 'IN', 'ON', 'AN',
             'LT', 'LTE', 'GB', 'MB', 'IP', 'ID', 'SS', 'VL', 'VM', 'TG', 'UP'}
-    m = re.search(r'\b([A-Z]{2})\b', remark.upper())
+    m = RE_COUNTRY_ISO.search(remark.upper())
     if m and m.group(1) not in SKIP:
         return m.group(1)
 
@@ -274,7 +278,7 @@ def fetch_one(url: str) -> list:
         text = resp.text.strip()
 
         # Сначала пробуем как сырой текст
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        found = RE_CONFIG_LINK.findall(text)
         if found:
             return found
 
@@ -282,7 +286,7 @@ def fetch_one(url: str) -> list:
         try:
             padded = text + '=' * (-len(text) % 4)
             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            found = RE_CONFIG_LINK.findall(decoded)
             if found:
                 return found
         except Exception:

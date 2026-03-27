@@ -1,1 +1,4 @@
+venv/
+hitray.db
+sources.json.migrated
 __pycache__/

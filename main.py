@@ -29,7 +29,10 @@ from database import (
 TOKEN = os.getenv('BOT_TOKEN')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')   # необязателен, но снимает rate-limit
 
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+try:
+    ADMIN_ID = int(os.getenv('ADMIN_ID', '-1'))
+except ValueError:
+    ADMIN_ID = -1
 
 HTTP_TIMEOUT = 6
 MAX_COUNTRIES = 10
@@ -58,14 +61,14 @@ def validate_source(url: str) -> int:
         if resp.status_code != 200:
             return 0
         text = resp.text.strip()
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        found = RE_CONFIG_LINK.findall(text)
         if found:
             return len(found)
         # Пробуем base64-подписку
         try:
             padded = text + '=' * (-len(text) % 4)
             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            found = RE_CONFIG_LINK.findall(decoded)
             return len(found)
         except Exception:
             pass
@@ -142,6 +145,13 @@ def kb_discover_add():
     b.button(text="🔙 Главное меню", callback_data="main_menu")
     b.adjust(1)
     return b.as_markup()
+
+
+# ─── Регулярки ───────────────────────────────────────────────────────────────
+
+RE_CONFIG_LINK = re.compile(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+')
+RE_COUNTRY_BRACKETS = re.compile(r'[\[\(|]([A-Za-z]{2})[\]\)|]')
+RE_COUNTRY_WORDS = re.compile(r'\b([A-Z]{2})\b')
 
 
 # ─── VPN логика ──────────────────────────────────────────────────────────────
@@ -232,14 +242,14 @@ def extract_country(remark: str) -> str:
             return code
 
     # 3. Скобочные паттерны: [RU], (DE), |FR|
-    m = re.search(r'[\[\(|]([A-Za-z]{2})[\]\)|]', remark)
+    m = RE_COUNTRY_BRACKETS.search(remark)
     if m:
         return m.group(1).upper()
 
     # 4. Просто два заглавных в слове
     SKIP = {'OK', 'NO', 'IS', 'DO', 'GO', 'TO', 'BE', 'OR', 'AS', 'IN', 'ON', 'AN',
             'LT', 'LTE', 'GB', 'MB', 'IP', 'ID', 'SS', 'VL', 'VM', 'TG', 'UP'}
-    m = re.search(r'\b([A-Z]{2})\b', remark.upper())
+    m = RE_COUNTRY_WORDS.search(remark.upper())
     if m and m.group(1) not in SKIP:
         return m.group(1)
 
@@ -249,8 +259,15 @@ def extract_country(remark: str) -> str:
 def tcp_ping(host: str, port: int) -> float:
     """Латентность TCP-соединения в мс, или inf при ошибке."""
     try:
+        # Resolve IP first so DNS doesn't skew the ping measurement
+        # getaddrinfo works for both IPv4 and IPv6
+        info = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        if not info:
+            return float('inf')
+        family, type, proto, canonname, sockaddr = info[0]
+
         t = time.perf_counter()
-        s = socket.create_connection((host, port), timeout=PING_TIMEOUT)
+        s = socket.create_connection(sockaddr, timeout=PING_TIMEOUT)
         ms = (time.perf_counter() - t) * 1000
         s.close()
         return round(ms, 1)
@@ -351,7 +368,7 @@ def fetch_one(url: str) -> list:
         text = resp.text.strip()
 
         # Сначала пробуем как сырой текст
-        found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', text)
+        found = RE_CONFIG_LINK.findall(text)
         if found:
             return found
 
@@ -359,7 +376,7 @@ def fetch_one(url: str) -> list:
         try:
             padded = text + '=' * (-len(text) % 4)
             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            found = re.findall(r'(?:vless|vmess|ss|trojan)://[^\s"\' <]+', decoded)
+            found = RE_CONFIG_LINK.findall(decoded)
             if found:
                 return found
         except Exception:
@@ -781,7 +798,7 @@ async def cb_get_sub(cb: types.CallbackQuery):
 
 
 def _is_admin(user_id: int) -> bool:
-    return ADMIN_ID == 0 or user_id == ADMIN_ID
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
 
 
 @dp.callback_query(F.data == "discover_add_all")

@@ -179,6 +179,16 @@ RU_NAMES: dict[str, str] = {
     'армения': 'AM', 'азербайджан': 'AZ',
 }
 
+RU_KW = ['ru', 'russia', 'россия', 'msk', 'moscow']
+EU_KW = ['eu', 'europe', 'de', 'germany', 'nl', 'netherlands', 'fi', 'finland', 'fr', 'france', 'pl', 'poland']
+
+
+def filter_sources(sources: list, country: str) -> list:
+    if country == 'all':
+        return sources
+    kw = RU_KW if country == 'ru' else EU_KW
+    return [s for s in sources if any(k in s.lower() for k in kw)]
+
 
 
 def parse_config(config: str):
